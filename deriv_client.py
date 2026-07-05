@@ -244,12 +244,18 @@ class DerivClient:
     # ------------------------------------------------------------------
     async def verify_account_type(self, expected: str) -> dict:
         """
-        Safety check: the REST account-resolution step already filters accounts
-        by account_type, so a connected client can only be for `self.account_type`.
-        This re-confirms that against `expected` (config.ACCOUNT_TYPE), plus a
-        loginid-prefix sanity check (Deriv virtual/demo loginids start "VR"),
-        so a stale account_id or a REST-layer bug can't silently trade the
-        wrong account.
+        Safety check: the REST account-resolution step (_resolve_account_id_sync)
+        is the authoritative source here — it walks Deriv's own
+        GET /trading/v1/options/accounts list and only picks an account_id whose
+        `account_type` field matches self.account_type. There is no reliable
+        loginid-prefix convention to double-check against on top of that (an
+        earlier version of this guessed "VR..." == demo, which is wrong for at
+        least this account naming scheme and caused false-positive refusals on
+        a correctly-resolved demo account). So this just confirms the
+        account_type this client was constructed/resolved with actually
+        matches `expected` (config.ACCOUNT_TYPE) — catching a config typo or a
+        client reused for the wrong purpose, without re-deriving account type
+        from unverified string patterns.
         """
         if self.account is None:
             raise DerivApiError("verify_account_type() called before connect()")
@@ -257,14 +263,6 @@ class DerivClient:
             raise DerivApiError(
                 f"ACCOUNT_TYPE mismatch: client resolved a '{self.account_type}' account "
                 f"but expected='{expected}'. Refusing to start."
-            )
-        loginid = str(self.account.get("loginid", ""))
-        is_virtual = loginid.upper().startswith("VR")
-        actual = "demo" if is_virtual else "real"
-        if actual != expected:
-            raise DerivApiError(
-                f"ACCOUNT_TYPE mismatch: expected '{expected}' but the connected account "
-                f"loginid={loginid!r} looks like a '{actual}' account. Refusing to start."
             )
         return self.account
 
