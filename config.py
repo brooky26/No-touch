@@ -14,7 +14,13 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")  # 1089 = Deriv's public demo app id
 DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN", "")  # token for the account you want to trade on
-DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+
+# Deriv's current auth flow no longer connects a static app_id WS url with an
+# "authorize" message. Instead, deriv_client.py resolves the account_id for
+# ACCOUNT_TYPE via REST, then exchanges it for a one-time, account-bound WS
+# url. If you already know your numeric account_id you can set it here to skip
+# the resolution call; otherwise leave it unset and it'll be looked up.
+DERIV_ACCOUNT_ID = os.getenv("DERIV_ACCOUNT_ID") or None
 
 # ACCOUNT_TYPE is a safety check, not a switch — Deriv tokens are already tied to a specific
 # account (demo or real) when you generate them. Set this to what you EXPECT the token above
