@@ -295,8 +295,15 @@ class DerivClient:
         """
         barrier_offset: signed offset from current spot, Deriv accepts relative barriers
         like "+12.34" / "-12.34" for NOTOUCH contracts.
+
+        Deriv now rejects barriers with more than 4 decimal places ("Barrier can only
+        be up to 4 decimal places"). Round HERE, once, before quoting — rather than
+        quoting at full precision and re-rounding separately in buy() — so the
+        ask_price/payout this returns are for the exact barrier that will actually
+        be bought, not a slightly different one.
         """
-        barrier_str = f"{'+' if barrier_offset >= 0 else ''}{barrier_offset:.5f}"
+        barrier_offset = round(barrier_offset, 4)
+        barrier_str = f"{'+' if barrier_offset >= 0 else ''}{barrier_offset:.4f}"
         resp = await self._send_checked({
             "proposal": 1,
             "amount": stake,
@@ -319,8 +326,12 @@ class DerivClient:
         Single parameterized buy call (the API no longer buys off a proposal id
         alone) — the same "buy": "1" + "parameters": {...} pattern the
         multi-symbol bot uses for EXPIRYRANGE, adapted for NOTOUCH.
+
+        proposal.barrier is already rounded to 4 decimal places by
+        get_notouch_proposal(), so this reuses it as-is rather than
+        re-rounding independently.
         """
-        barrier_str = f"{'+' if proposal.barrier >= 0 else ''}{proposal.barrier:.5f}"
+        barrier_str = f"{'+' if proposal.barrier >= 0 else ''}{proposal.barrier:.4f}"
         resp = await self._send_checked({
             "buy": "1",
             "price": proposal.ask_price,
