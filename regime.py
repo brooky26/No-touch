@@ -10,10 +10,17 @@ Same HMM infrastructure pattern used across your other bots. Fits a Gaussian HMM
 3 states by default: low-vol/mean-reverting, trending, high-vol/crisis (config.HMM_N_REGIMES).
 """
 from __future__ import annotations
+import warnings
 import numpy as np
 from hmmlearn.hmm import GaussianHMM
 
 import config
+
+# hmmlearn warns via Python's warnings module every time a fit doesn't hit its convergence
+# tolerance within n_iter. With 5 restarts x 12 symbols every calibration cycle that's dozens
+# of near-duplicate log lines per cycle for something that isn't actionable (we already select
+# the best-scoring restart and clamp degenerate variances below) -- silence just this category.
+warnings.filterwarnings("ignore", message=".*is not converging.*")
 
 
 class RegimeDetector:

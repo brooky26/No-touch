@@ -138,7 +138,13 @@ class SymbolCalibrator:
                 c.ev_per_stake = staking.expected_value_per_stake(
                     c.p_no_touch_calibrated, payout_per_unit_stake, stake=1.0,
                 )
-            except Exception:
+            except Exception as e:
+                # This used to fail silently (ev_per_stake stayed None with no trace), which
+                # made a systematic proposal-side problem (bad duration/barrier for this
+                # contract, stake below Deriv's minimum, etc.) indistinguishable from "the
+                # EV floor correctly rejected everything" in the logs. Surface it instead.
+                print(f"[calibrator] {symbol}: proposal failed for barrier={c.distance_price:.5f} "
+                      f"duration={c.duration_value}{c.duration_unit}: {e}")
                 c.ev_per_stake = None
         return candidates_sorted[:top_k]
 
@@ -162,6 +168,21 @@ class SymbolCalibrator:
                     and c.p_no_touch_ci_low >= config.MIN_WIN_PROB_FLOOR
                 ]
                 if not viable:
+                    # Same silent-failure problem as above, one level up: previously this
+                    # just moved on to the next symbol with zero trace of *how close* (or
+                    # far) the best candidate actually was. Log the closest miss so a run
+                    # that rejects everything is diagnosable instead of a black box.
+                    quoted_ok = [c for c in quoted if c.ev_per_stake is not None]
+                    if quoted_ok:
+                        near = max(quoted_ok, key=lambda c: (c.ev_per_stake, c.p_no_touch_ci_low))
+                        print(f"[calibrator] {symbol}: nothing viable — closest miss "
+                              f"ev={near.ev_per_stake:.4f} (floor {config.EV_FLOOR}), "
+                              f"win_prob_ci_low={near.p_no_touch_ci_low:.3f} "
+                              f"(floor {config.MIN_WIN_PROB_FLOOR}), "
+                              f"barrier={near.distance_sigma}σ duration={near.duration_value}{near.duration_unit}")
+                    else:
+                        print(f"[calibrator] {symbol}: all {len(quoted)} quoted candidates "
+                              f"failed at the proposal stage (see errors above)")
                     continue
                 best = max(viable, key=lambda c: c.ev_per_stake)
 
