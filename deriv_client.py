@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -296,30 +297,47 @@ class DerivClient:
         barrier_offset: signed offset from current spot, Deriv accepts relative barriers
         like "+12.34" / "-12.34" for NOTOUCH contracts.
 
-        Deriv now rejects barriers with more than 4 decimal places ("Barrier can only
-        be up to 4 decimal places"). Round HERE, once, before quoting — rather than
-        quoting at full precision and re-rounding separately in buy() — so the
-        ask_price/payout this returns are for the exact barrier that will actually
-        be bought, not a slightly different one.
+        The allowed decimal precision is NOT a fixed constant across symbols -- it scales
+        with each symbol's pip size (observed in practice: R_10-family barriers reject past
+        3 decimals, others past 2, and this can differ again for symbols not seen yet).
+        Hardcoding one number (a previous version assumed 4 for everyone) silently killed
+        every candidate for whichever symbols didn't match that guess. Instead: try at full
+        precision first, and if Deriv's error names the actual allowed decimal count
+        ("...can not have more than N decimal places"), round to exactly that and retry once.
         """
-        barrier_offset = round(barrier_offset, 4)
-        barrier_str = f"{'+' if barrier_offset >= 0 else ''}{barrier_offset:.4f}"
-        resp = await self._send_checked({
-            "proposal": 1,
-            "amount": stake,
-            "basis": "stake",
-            "contract_type": "NOTOUCH",
-            "currency": "USD",
-            "underlying_symbol": symbol,
-            "duration": duration,
-            "duration_unit": duration_unit,
-            "barrier": barrier_str,
-        })
-        p = resp["proposal"]
-        return Proposal(
-            id=p.get("id", ""), symbol=symbol, barrier=barrier_offset, duration=duration,
-            duration_unit=duration_unit, ask_price=float(p["ask_price"]), payout=float(p["payout"]),
-        )
+        barrier_offset = round(barrier_offset, 5)
+        max_attempts = 3
+        last_error = None
+        for _ in range(max_attempts):
+            barrier_str = f"{'+' if barrier_offset >= 0 else ''}{barrier_offset:.5f}".rstrip("0")
+            if barrier_str.endswith("."):
+                barrier_str += "0"
+            try:
+                resp = await self._send_checked({
+                    "proposal": 1,
+                    "amount": stake,
+                    "basis": "stake",
+                    "contract_type": "NOTOUCH",
+                    "currency": "USD",
+                    "underlying_symbol": symbol,
+                    "duration": duration,
+                    "duration_unit": duration_unit,
+                    "barrier": barrier_str,
+                })
+                p = resp["proposal"]
+                return Proposal(
+                    id=p.get("id", ""), symbol=symbol, barrier=barrier_offset, duration=duration,
+                    duration_unit=duration_unit, ask_price=float(p["ask_price"]), payout=float(p["payout"]),
+                )
+            except DerivApiError as e:
+                last_error = e
+                match = re.search(r"more than (\d+) decimal places?", str(e))
+                if match:
+                    allowed_decimals = int(match.group(1))
+                    barrier_offset = round(barrier_offset, allowed_decimals)
+                    continue
+                raise  # a different error (e.g. "offers no return") -- don't retry, propagate as-is
+        raise last_error
 
     async def buy(self, proposal: Proposal) -> int:
         """
@@ -327,11 +345,13 @@ class DerivClient:
         alone) — the same "buy": "1" + "parameters": {...} pattern the
         multi-symbol bot uses for EXPIRYRANGE, adapted for NOTOUCH.
 
-        proposal.barrier is already rounded to 4 decimal places by
-        get_notouch_proposal(), so this reuses it as-is rather than
-        re-rounding independently.
+        proposal.barrier carries whatever precision get_notouch_proposal() settled on
+        (it may have had to reduce precision from Deriv's per-symbol error), so this
+        formats at up to 5 decimals with trailing zeros stripped rather than forcing 4.
         """
-        barrier_str = f"{'+' if proposal.barrier >= 0 else ''}{proposal.barrier:.4f}"
+        barrier_str = f"{'+' if proposal.barrier >= 0 else ''}{proposal.barrier:.5f}".rstrip("0")
+        if barrier_str.endswith("."):
+            barrier_str += "0"
         resp = await self._send_checked({
             "buy": "1",
             "price": proposal.ask_price,

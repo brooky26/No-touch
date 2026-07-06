@@ -175,11 +175,17 @@ class SymbolCalibrator:
                     quoted_ok = [c for c in quoted if c.ev_per_stake is not None]
                     if quoted_ok:
                         near = max(quoted_ok, key=lambda c: (c.ev_per_stake, c.p_no_touch_ci_low))
+                        payout_ratio = (near.payout / near.ask_price) if near.ask_price else None
                         print(f"[calibrator] {symbol}: nothing viable — closest miss "
                               f"ev={near.ev_per_stake:.4f} (floor {config.EV_FLOOR}), "
                               f"win_prob_ci_low={near.p_no_touch_ci_low:.3f} "
                               f"(floor {config.MIN_WIN_PROB_FLOOR}), "
-                              f"barrier={near.distance_sigma}σ duration={near.duration_value}{near.duration_unit}")
+                              f"barrier={near.distance_sigma}σ duration={near.duration_value}{near.duration_unit} | "
+                              f"model_breakdown: analytical={near.p_analytical:.3f} "
+                              f"bootstrap={near.p_bootstrap:.3f} "
+                              f"markov={near.p_markov if near.p_markov is None else round(near.p_markov, 3)} "
+                              f"confidence={near.ensemble_confidence:.3f} | "
+                              f"quoted_payout_ratio={payout_ratio}")
                     else:
                         print(f"[calibrator] {symbol}: all {len(quoted)} quoted candidates "
                               f"failed at the proposal stage (see errors above)")
