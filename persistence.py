@@ -54,6 +54,49 @@ class SupabaseStore:
             "picks_json": json.dumps(picks), "created_at": time.time(),
         }).execute()
 
+    # -- Self-Improvement Engine: model version snapshots + rollback --------
+    def save_model_version(self, tracker_state: dict, validation_brier: float):
+        self.client.table("touch_bot_model_versions").insert({
+            "tracker_state_json": json.dumps(tracker_state),
+            "validation_brier": validation_brier,
+            "created_at": time.time(),
+        }).execute()
+
+    def load_latest_model_version(self) -> dict | None:
+        resp = (self.client.table("touch_bot_model_versions").select("*")
+                .order("created_at", desc=True).limit(1).execute())
+        if not resp.data:
+            return None
+        row = resp.data[0]
+        return {
+            "tracker_state": json.loads(row["tracker_state_json"]),
+            "validation_brier": row["validation_brier"],
+            "created_at": row["created_at"],
+        }
+
+    def load_recent_predictions(self, days: float) -> list[dict]:
+        """Settled trades (won is not null) from the last `days`, for Brier-score validation."""
+        cutoff = time.time() - days * 86400
+        resp = (self.client.table("touch_bot_trades").select("p_no_touch_est,won")
+                .gte("created_at", cutoff).not_.is_("won", "null").execute())
+        return resp.data or []
+
+    def save_self_improvement_run(self, summary: dict):
+        self.client.table("touch_bot_self_improvement_runs").insert({
+            "summary_json": json.dumps(summary), "created_at": time.time(),
+        }).execute()
+
+    def load_self_improvement_last_run(self) -> float | None:
+        resp = self.client.table("touch_bot_self_improvement_state").select("*").eq("id", 1).execute()
+        if resp.data:
+            return resp.data[0]["last_run_at"]
+        return None
+
+    def save_self_improvement_last_run(self, ts: float):
+        self.client.table("touch_bot_self_improvement_state").upsert({
+            "id": 1, "last_run_at": ts,
+        }).execute()
+
     # -- Active symbol slots + consecutive loss tracking -------------------
     def save_active_symbols(self, slots: dict):
         """slots: {symbol: {"consecutive_losses": int, "candidate": {...}}}"""

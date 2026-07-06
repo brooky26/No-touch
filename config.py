@@ -50,17 +50,75 @@ TOP_N_SYMBOLS = 3               # how many symbols the bot actively trades at on
 CONSECUTIVE_LOSS_RECAL_TRIGGER = 2   # recalibrate a symbol slot after this many losses in a row
 
 # ---------------------------------------------------------------------------
-# Calibration grid — barrier distances (in units of current EWMA sigma) and durations
+# Calibration grid — barrier distances (in units of current EWMA sigma), and the
+# DURATION SEARCH SPACE the Intelligence Stack auto-selects from (see
+# ensemble.select_durations_for_barrier). Durations run from 5 ticks up to
+# ~30 minutes -- short-horizon NOTOUCH only, no fixed-duration grid: for each
+# barrier distance, the ensemble sweeps this whole space and picks whichever
+# duration(s) sit just above the win-probability floor (best payout-per-risk),
+# rather than trading a duration a human picked in advance.
 # ---------------------------------------------------------------------------
-BARRIER_DISTANCE_GRID_SIGMA = [0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0]   # multiples of sigma*sqrt(T)
-DURATION_GRID = [
-    # (duration_value, duration_unit) — Deriv units: t (ticks), s, m, h, d
-    (15, "m"), (30, "m"), (1, "h"), (2, "h"), (4, "h"), (1, "d"),
+BARRIER_DISTANCE_GRID_SIGMA = [0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0]   # multiples of sigma*T^exponent
+DURATION_SEARCH_SPACE = [
+    # (duration_value, duration_unit) — Deriv units: t (ticks), m (minutes)
+    (5, "t"), (10, "t"), (15, "t"), (20, "t"), (30, "t"), (50, "t"), (75, "t"), (100, "t"),
+    (1, "m"), (2, "m"), (3, "m"), (5, "m"), (7, "m"), (10, "m"), (15, "m"), (20, "m"), (30, "m"),
 ]
+DURATION_AUTOSELECT_TOP_K = 2   # how many auto-selected durations per barrier proceed to quoting
+
+# Approximate seconds-per-tick per symbol family, used only to convert minute-based
+# search-space entries into a simulation step count consistent with the tick-based
+# entries (Deriv's own tick cadence is what actually matters at execution time --
+# this is just so "3 minutes" and "90 ticks" get treated as roughly the same
+# simulation horizon on a 2s-tick symbol).
+SYMBOL_TICK_INTERVAL_SECONDS = {
+    "R_10": 2.0, "R_25": 2.0, "R_50": 2.0, "R_75": 2.0, "R_100": 2.0,
+    "1HZ10V": 1.0, "1HZ25V": 1.0, "1HZ50V": 1.0, "1HZ75V": 1.0, "1HZ100V": 1.0,
+    "RDBULL": 2.0, "RDBEAR": 2.0,
+}
+DEFAULT_TICK_INTERVAL_SECONDS = 2.0
 
 HISTORY_TICKS_FOR_CALIBRATION = 5000     # ticks pulled per symbol for regime/hurst/vol estimation
-BOOTSTRAP_N_PATHS = 2000                 # Monte Carlo / block-bootstrap paths per candidate
+
+# Monte Carlo / block-bootstrap paths. Sweeping the full (symbol x duration-search-space
+# x barrier) grid at the full path count would be far too slow, so the search/screening
+# pass uses a cheap path count, and only the single best candidate per symbol gets a
+# full-precision confirmation pass (config.MC_SIMULATIONS = 75,000, matching the MC path
+# count used consistently across the other bots) right before it's quoted/traded.
+MC_SCREENING_PATHS = int(os.getenv("MC_SCREENING_PATHS", "2000"))
+MC_SIMULATIONS = int(os.getenv("MC_SIMULATIONS", "75000"))
 BOOTSTRAP_BLOCK_SIZE = 50                # stationary block bootstrap block length (ticks)
+
+# ---------------------------------------------------------------------------
+# Intelligence Stack toggles — each can be disabled independently (e.g. while
+# debugging) without touching ensemble.py. All default on.
+# ---------------------------------------------------------------------------
+GARCH_ENABLED = os.getenv("GARCH_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+KALMAN_ENABLED = os.getenv("KALMAN_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+HAWKES_ENABLED = os.getenv("HAWKES_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+ARFIMA_ENABLED = os.getenv("ARFIMA_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+MARKOV_ENABLED = os.getenv("MARKOV_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# Self-Improvement Engine — daily walk-forward validation + rollback protection
+# ---------------------------------------------------------------------------
+# What it actually validates: the Bayesian posterior layer is the only piece of
+# PERSISTED state that accumulates online across trades (the HMM/GARCH/Kalman/
+# ARFIMA models are refit fresh from live tick history every calibration cycle,
+# so they can't go stale/need a rollback the way persisted state can). Once a
+# day, it checks whether the tracker's calibration quality (Brier score of
+# logged p_no_touch_est vs realized outcome) over the last
+# SELF_IMPROVEMENT_VALIDATION_DAYS has gotten WORSE than the last snapshot's
+# score by more than the tolerance below -- if so it rolls the tracker back to
+# that last known-good snapshot rather than continuing to serve a degraded one.
+SELF_IMPROVEMENT_ENABLED = os.getenv("SELF_IMPROVEMENT_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+SELF_IMPROVEMENT_INTERVAL_SECONDS = int(os.getenv("SELF_IMPROVEMENT_INTERVAL_SECONDS", str(24 * 3600)))
+SELF_IMPROVEMENT_VALIDATION_DAYS = float(os.getenv("SELF_IMPROVEMENT_VALIDATION_DAYS", "3"))
+SELF_IMPROVEMENT_MIN_TRADES_FOR_VALIDATION = int(os.getenv("SELF_IMPROVEMENT_MIN_TRADES_FOR_VALIDATION", "20"))
+# Brier score is in [0,1] (lower = better calibrated); this is an absolute-points
+# tolerance, not a percentage -- a jump of more than this over the last snapshot
+# triggers a rollback.
+SELF_IMPROVEMENT_ROLLBACK_BRIER_TOLERANCE = float(os.getenv("SELF_IMPROVEMENT_ROLLBACK_BRIER_TOLERANCE", "0.05"))
 
 # ---------------------------------------------------------------------------
 # Regime detection (HMM)
@@ -69,10 +127,17 @@ HMM_N_REGIMES = 3           # low-vol/mean-reverting, trending, high-vol/crisis
 HMM_REFIT_EVERY_N_CYCLES = 20
 
 # ---------------------------------------------------------------------------
-# Risk / staking (moderate posture: live, small fixed-ish stakes, EV floor gated)
+# Risk / staking (tiny bankroll posture: starting balance is $0.35, so BASE_STAKE
+# and MAX_STAKE default to Deriv's own practical minimum stake for these contracts
+# rather than an arbitrary larger number -- there's no room for Kelly sizing to
+# size UP from here until the balance actually grows past the minimum many times
+# over. MIN_STAKE is a hard floor: below it, Deriv will reject the contract
+# outright, so staking.py refuses to size a trade under it rather than attempting
+# one that will just error out.)
 # ---------------------------------------------------------------------------
-BASE_STAKE = float(os.getenv("BASE_STAKE", "1.0"))       # account currency units
-MAX_STAKE = float(os.getenv("MAX_STAKE", "5.0"))
+MIN_STAKE = float(os.getenv("MIN_STAKE", "0.35"))        # Deriv's practical floor for these contracts
+BASE_STAKE = float(os.getenv("BASE_STAKE", "0.35"))       # account currency units
+MAX_STAKE = float(os.getenv("MAX_STAKE", "0.35"))
 EV_FLOOR = float(os.getenv("EV_FLOOR", "0.02"))          # candidate must clear +2% EV/stake to be tradable
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))  # fractional Kelly (safety multiplier)
 MIN_WIN_PROB_FLOOR = float(os.getenv("MIN_WIN_PROB_FLOOR", "0.55"))  # Bayesian posterior floor to trade a cell

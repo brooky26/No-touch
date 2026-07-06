@@ -32,6 +32,12 @@ def kelly_fraction(p_win: float, payout: float, stake: float) -> float:
     return max(0.0, min(1.0, f))
 
 
+def bankroll_can_trade(bankroll: float, min_stake: float = config.MIN_STAKE) -> bool:
+    """False once the bankroll has dropped below what Deriv will even accept as a stake --
+    the bot should stand down cleanly rather than attempt trades that will just error out."""
+    return bankroll >= min_stake
+
+
 def size_stake(p_win_mean: float, p_win_low_ci: float, payout_per_unit_stake: float,
                bankroll: float, base_stake: float = config.BASE_STAKE,
                max_stake: float = config.MAX_STAKE,
@@ -42,17 +48,26 @@ def size_stake(p_win_mean: float, p_win_low_ci: float, payout_per_unit_stake: fl
     - Uses the *lower* credible-interval bound of p_win (conservative) to size Kelly, so
       uncertain cells naturally get smaller stakes even at the same point estimate.
     - Applies fractional Kelly (config.KELLY_FRACTION) for safety.
-    - Clipped to [base_stake_floor=0, max_stake] and never exceeds a sane % of bankroll.
+    - Hard floor at config.MIN_STAKE (Deriv rejects anything below it) and hard ceiling at
+      both max_stake AND the actual bankroll -- sizing must never risk more than the
+      account actually has, regardless of what Kelly's formula alone would suggest.
     """
+    if not bankroll_can_trade(bankroll):
+        return 0.0
+
     f_conservative = kelly_fraction(p_win_low_ci, payout_per_unit_stake, stake=1.0)
     f_scaled = f_conservative * kelly_frac_multiplier
     kelly_stake = f_scaled * bankroll
 
-    stake = max(0.0, min(kelly_stake, max_stake))
-    # never trade below a sane minimum granularity, and never below zero conviction
-    if stake < base_stake * 0.5:
-        stake = 0.0 if f_conservative <= 0 else base_stake
-    return round(min(stake, max_stake), 2)
+    hard_ceiling = min(max_stake, bankroll)
+    stake = max(0.0, min(kelly_stake, hard_ceiling))
+    # never trade below Deriv's minimum granularity, and never below zero conviction
+    if stake < config.MIN_STAKE:
+        stake = 0.0 if f_conservative <= 0 else min(base_stake, hard_ceiling)
+    if stake < config.MIN_STAKE:
+        # even base_stake doesn't fit under the bankroll ceiling -- can't trade this cycle
+        return 0.0
+    return round(min(stake, hard_ceiling), 2)
 
 
 def passes_ev_floor(p_win_mean: float, payout_per_unit_stake: float,

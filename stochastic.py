@@ -269,19 +269,29 @@ def stationary_block_bootstrap_returns(returns: np.ndarray, n_steps: int, n_path
     Politis-Romano stationary block bootstrap: resample overlapping blocks of historical
     returns (geometric block-length ~ block_size) to preserve autocorrelation and volatility
     clustering. Returns array shape (n_paths, n_steps) of resampled returns.
+
+    Vectorized across paths (the loop is over n_steps only, with every path's index
+    advanced/restarted in one vectorized numpy operation per step) rather than a
+    per-path-per-step nested Python loop -- statistically identical to the naive
+    per-path loop, but the difference between ~900 Python-level iterations and
+    ~67 million is the difference between this being usable for a short-duration,
+    fast-turnaround bot (5 ticks to a few minutes) and a full 75,000-path confirmation
+    pass taking the better part of a minute.
     """
     rng = np.random.default_rng(seed)
     returns = np.asarray(returns, dtype=float)
     n_hist = len(returns)
     p_restart = 1.0 / block_size
+
+    idx = rng.integers(0, n_hist, size=n_paths)
     out = np.empty((n_paths, n_steps))
-    for p in range(n_paths):
-        idx = rng.integers(0, n_hist)
-        for t in range(n_steps):
-            out[p, t] = returns[idx]
-            idx = idx + 1
-            if idx >= n_hist or rng.random() < p_restart:
-                idx = rng.integers(0, n_hist)
+    for t in range(n_steps):
+        out[:, t] = returns[idx]
+        idx = idx + 1
+        restart_mask = (idx >= n_hist) | (rng.random(n_paths) < p_restart)
+        n_restart = int(restart_mask.sum())
+        if n_restart:
+            idx[restart_mask] = rng.integers(0, n_hist, size=n_restart)
     return out
 
 

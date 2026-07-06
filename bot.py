@@ -24,6 +24,7 @@ from deriv_client import DerivClient
 from calibrator import SymbolCalibrator, Candidate
 from bayesian import BayesianTracker
 from persistence import SupabaseStore
+from self_improvement import SelfImprovementEngine
 import staking
 
 
@@ -33,9 +34,15 @@ class TouchBot:
         self.store = SupabaseStore()
         self.tracker: BayesianTracker = self.store.load_bayesian_tracker()
         self.calibrator = SymbolCalibrator(self.client, self.tracker)
+        self.self_improvement = SelfImprovementEngine(self.store)
         # slots: {symbol: {"consecutive_losses": int, "candidate": Candidate}}
         self.slots: dict[str, dict] = {}
         self.last_full_recal = 0.0
+        # local throttle so we only ask the (Supabase-backed) engine "is it time yet"
+        # every few minutes rather than every poll tick -- it self-gates to once a day
+        # internally, this is just to avoid a wasted round-trip every 5 seconds.
+        self.last_self_improvement_check = 0.0
+        self.self_improvement_check_interval = 600  # 10 minutes
 
     async def start(self):
         await self.client.connect()
@@ -52,13 +59,31 @@ class TouchBot:
         await self.recalibrate()
         while True:
             try:
-                await self.trade_cycle()
+                await self.maybe_run_self_improvement()
+                bankroll = await self.client.get_balance()
+                if not staking.bankroll_can_trade(bankroll):
+                    print(f"[bot] balance {bankroll} is below the minimum stake "
+                          f"({config.MIN_STAKE}) -- standing down, not attempting trades this cycle")
+                else:
+                    await self.trade_cycle()
             except Exception:
                 print("[bot] error in trade cycle:")
                 traceback.print_exc()
             if time.time() - self.last_full_recal > config.FULL_RECAL_EVERY_SECONDS:
                 await self.recalibrate()
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
+
+    async def maybe_run_self_improvement(self):
+        if time.time() - self.last_self_improvement_check < self.self_improvement_check_interval:
+            return
+        self.last_self_improvement_check = time.time()
+        new_tracker, summary = self.self_improvement.maybe_run_daily(self.tracker)
+        if summary is not None:
+            self.tracker = new_tracker
+            # SymbolCalibrator holds its own reference to the tracker object -- if a
+            # rollback swapped in a different BayesianTracker instance, it needs to be
+            # repointed at the same object bot.py is now using, not the stale one.
+            self.calibrator.tracker = self.tracker
 
     async def recalibrate(self):
         print("[bot] running full universe calibration ...")
