@@ -154,7 +154,7 @@ MIN_WIN_PROB_FLOOR = float(os.getenv("MIN_WIN_PROB_FLOOR", "0.55"))  # Bayesian 
 # pass both individual floors). Both gates are enforced together in calibrator.py precisely
 # to close that gap -- MIN_RETURN_PCT narrows down to attractively-priced candidates first,
 # EV_FLOOR is still the final word on whether it's actually worth taking.
-MIN_RETURN_PCT = float(os.getenv("MIN_RETURN_PCT", "0.40"))
+MIN_RETURN_PCT = float(os.getenv("MIN_RETURN_PCT", "0.01"))
 
 # ---------------------------------------------------------------------------
 # Bayesian priors (Beta-Bernoulli), weak uninformative prior per new cell
