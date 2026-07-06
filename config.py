@@ -142,6 +142,20 @@ EV_FLOOR = float(os.getenv("EV_FLOOR", "0.02"))          # candidate must clear 
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))  # fractional Kelly (safety multiplier)
 MIN_WIN_PROB_FLOOR = float(os.getenv("MIN_WIN_PROB_FLOOR", "0.55"))  # Bayesian posterior floor to trade a cell
 
+# Explicit minimum PAYOUT RETURN gate, checked against Deriv's actual quoted proposal --
+# distinct from EV_FLOOR. EV_FLOOR asks "is probability x payout worth it", which is the
+# mathematically correct gate, but is opaque as a single number. MIN_RETURN_PCT is the plain
+# version: "don't bother unless this specific barrier/duration actually pays out N% or more"
+# (0.40 = candidate must offer at least a 40% return, i.e. payout >= 1.4x stake).
+#
+# IMPORTANT: these two gates are NOT redundant, and passing both does not guarantee the other.
+# A candidate can clear MIN_WIN_PROB_FLOOR and MIN_RETURN_PCT individually while still being
+# -EV: e.g. p=0.55, payout=1.40x stake -> EV = 0.55*1.40 - 1 = -0.23 (a bad trade that would
+# pass both individual floors). Both gates are enforced together in calibrator.py precisely
+# to close that gap -- MIN_RETURN_PCT narrows down to attractively-priced candidates first,
+# EV_FLOOR is still the final word on whether it's actually worth taking.
+MIN_RETURN_PCT = float(os.getenv("MIN_RETURN_PCT", "0.40"))
+
 # ---------------------------------------------------------------------------
 # Bayesian priors (Beta-Bernoulli), weak uninformative prior per new cell
 # ---------------------------------------------------------------------------

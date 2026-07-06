@@ -122,8 +122,14 @@ class SymbolCalibrator:
 
         return candidates
 
-    async def _quote_top_candidates(self, symbol: str, candidates: list[Candidate], top_k: int = 3):
-        """Fetch live Deriv proposals for the most promising model candidates and compute EV."""
+    async def _quote_candidates(self, symbol: str, candidates: list[Candidate], top_k: int = 5):
+        """
+        STAGE 2 — market gate: fetch a real Deriv proposal for each MC-confident candidate
+        (candidates here have already cleared MIN_WIN_PROB_FLOOR in calibrate_universe --
+        this function doesn't re-check that) and compute the actual payout return + EV.
+        top_k caps how many of the MC-confident set actually hit the API per symbol per
+        cycle, since every call here is a real network round-trip, not simulation.
+        """
         candidates_sorted = sorted(candidates, key=lambda c: c.p_no_touch_calibrated, reverse=True)
         for c in candidates_sorted[:top_k]:
             try:
@@ -150,9 +156,21 @@ class SymbolCalibrator:
 
     async def calibrate_universe(self) -> list[tuple[str, Candidate]]:
         """
-        Scan every symbol in the universe, return a list of (symbol, best_candidate) sorted
-        by EV descending, restricted to candidates that clear the EV floor and win-prob floor
-        -- and that survive a final full-precision (config.MC_SIMULATIONS) confirmation pass.
+        Scan every symbol in the universe using an explicit two-stage gate:
+
+        STAGE 1 (MC/statistical) — the ensemble sweep already ran every (barrier, duration)
+        candidate through simulation in _calibrate_symbol; here we filter down to only the
+        ones the model is actually confident about (p_no_touch_ci_low clears
+        MIN_WIN_PROB_FLOOR). This is pure model output — no market data, no API calls yet.
+
+        STAGE 2 (market/return) — for ONLY those MC-confident candidates, ask Deriv for a
+        real quote and keep the ones that both (a) pay at least MIN_RETURN_PCT and (b) clear
+        EV_FLOOR. Both matter: MIN_RETURN_PCT alone doesn't imply positive EV (a candidate
+        can pay 40%+ and still be a bad bet at a middling win probability), so EV_FLOOR is
+        still the final word on whether a candidate that clears MIN_RETURN_PCT is worth it.
+
+        The single best surviving candidate per symbol then goes through a final
+        full-precision (config.MC_SIMULATIONS) confirmation pass before being accepted.
         """
         results: list[tuple[str, Candidate]] = []
         for symbol in config.SYMBOL_UNIVERSE:
@@ -160,34 +178,48 @@ class SymbolCalibrator:
                 candidates = await self._calibrate_symbol(symbol)
                 if not candidates:
                     continue
-                quoted = await self._quote_top_candidates(symbol, candidates, top_k=3)
+
+                # STAGE 1 — MC gate: which barriers does simulation say won't get touched,
+                # and over what duration. No API calls yet.
+                mc_confident = [c for c in candidates if c.p_no_touch_ci_low >= config.MIN_WIN_PROB_FLOOR]
+                if not mc_confident:
+                    near = max(candidates, key=lambda c: c.p_no_touch_ci_low)
+                    print(f"[calibrator] {symbol}: MC gate — nothing clears win-prob floor "
+                          f"(closest: {near.p_no_touch_ci_low:.3f} at barrier={near.distance_sigma}σ "
+                          f"duration={near.duration_value}{near.duration_unit}, "
+                          f"floor {config.MIN_WIN_PROB_FLOOR})")
+                    continue
+
+                # STAGE 2 — market gate: does Deriv actually pay enough for these specific,
+                # MC-confident barrier/duration combos.
+                quoted = await self._quote_candidates(symbol, mc_confident, top_k=5)
                 viable = [
                     c for c in quoted
-                    if c.ev_per_stake is not None
+                    if c.ev_per_stake is not None and c.ask_price
+                    and (c.payout / c.ask_price - 1) >= config.MIN_RETURN_PCT
                     and c.ev_per_stake >= config.EV_FLOOR
-                    and c.p_no_touch_ci_low >= config.MIN_WIN_PROB_FLOOR
                 ]
                 if not viable:
                     # Same silent-failure problem as above, one level up: previously this
                     # just moved on to the next symbol with zero trace of *how close* (or
                     # far) the best candidate actually was. Log the closest miss so a run
                     # that rejects everything is diagnosable instead of a black box.
-                    quoted_ok = [c for c in quoted if c.ev_per_stake is not None]
+                    quoted_ok = [c for c in quoted if c.ev_per_stake is not None and c.ask_price]
                     if quoted_ok:
-                        near = max(quoted_ok, key=lambda c: (c.ev_per_stake, c.p_no_touch_ci_low))
-                        payout_ratio = (near.payout / near.ask_price) if near.ask_price else None
-                        print(f"[calibrator] {symbol}: nothing viable — closest miss "
+                        near = max(quoted_ok, key=lambda c: c.ev_per_stake)
+                        return_pct = near.payout / near.ask_price - 1
+                        print(f"[calibrator] {symbol}: market gate — {len(mc_confident)} "
+                              f"MC-confident candidate(s) quoted, none cleared both floors. "
+                              f"Closest: return={return_pct:.1%} (floor {config.MIN_RETURN_PCT:.0%}), "
                               f"ev={near.ev_per_stake:.4f} (floor {config.EV_FLOOR}), "
-                              f"win_prob_ci_low={near.p_no_touch_ci_low:.3f} "
-                              f"(floor {config.MIN_WIN_PROB_FLOOR}), "
+                              f"win_prob_ci_low={near.p_no_touch_ci_low:.3f}, "
                               f"barrier={near.distance_sigma}σ duration={near.duration_value}{near.duration_unit} | "
                               f"model_breakdown: analytical={near.p_analytical:.3f} "
                               f"bootstrap={near.p_bootstrap:.3f} "
                               f"markov={near.p_markov if near.p_markov is None else round(near.p_markov, 3)} "
-                              f"confidence={near.ensemble_confidence:.3f} | "
-                              f"quoted_payout_ratio={payout_ratio}")
+                              f"confidence={near.ensemble_confidence:.3f}")
                     else:
-                        print(f"[calibrator] {symbol}: all {len(quoted)} quoted candidates "
+                        print(f"[calibrator] {symbol}: all {len(quoted)} MC-confident candidates "
                               f"failed at the proposal stage (see errors above)")
                     continue
                 best = max(viable, key=lambda c: c.ev_per_stake)
