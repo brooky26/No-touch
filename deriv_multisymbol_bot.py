@@ -1,733 +1,140 @@
 """
-Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER  v3
-==========================================================
-Single-file bot. Scans all eligible synthetic-index symbols, runs an
-18-layer intelligence pipeline per symbol using fitted statistical models,
-fuses evidence via a meta-learner with Bayesian fallback, auto-selects trade
-duration via Monte Carlo simulation, and allocates capital across symbols
-by edge × confidence × correlation adjustment.
+Deriv Expiry Range / No Touch Auto-Trading Bot
+===============================================
+Python port of the "QUANTUM ENDS-IN-OUT / NO TOUCH" Deriv Blockly (DBot)
+strategy, extended with Monte Carlo duration + barrier selection for BOTH
+contract types.
 
-v3 UPGRADES (2026-07-01):
-─────────────────────────────────────────────────────────────────
-UPGRADE 1 — Drift Detection (KS + PSI + CUSUM).
-  Three independent degradation detectors run continuously:
-  · KS-test: return distribution shift vs. training window
-  · PSI: confidence score population stability index
-  · CUSUM: sequential win-rate degradation detector
-  Any single detector firing triggers immediate recalibration AND
-  a stake reduction to 50% of normal until the model is fresh again.
-  Replaces blind 2-hour fixed-interval recalibration.
+STRATEGY (ported from the original XML)
+----------------------------------------
+- EMA(7) / EMA(14) computed on 60s candles built from the live tick stream
+  (same candle interval as the original bot).
+- A regime read on every new candle decides WHICH contract to trade:
+    * Trending / low-choppiness regime  -> NO TOUCH
+      (mirrors the original bot's entry trigger: EMA(7) crossing below
+      EMA(14) - i.e. was 7>14 on the prior candle, now 7<14 - confirmed by
+      a black/bearish candle. A clean, confirmed cross means price is
+      moving away from a level with room to place a barrier it likely
+      won't come back to touch.)
+    * Choppy / ranging regime -> EXPIRY RANGE ("ends in/out")
+      (small EMA gap + low directional persistence = price is oscillating,
+      which is exactly the condition ends-in-range wants.)
+- Regime strength is measured with a lightweight Wilder-style ADX and the
+  normalised EMA(7)-EMA(14) gap - no external ML stack required.
 
-UPGRADE 2 — Meta-Learner Fusion (replaces Bayesian log-odds).
-  A logistic-regression meta-model trained on per-layer OOS outputs → 
-  actual trade outcomes replaces the static weighted log-odds fusion.
-  Learns interaction effects between correlated layers (RSI↔StochRSI,
-  HMM↔ARFIMA, Kalman↔OU) that additive log-odds cannot capture.
-  Graceful fallback to Bayesian fusion when <200 training samples exist.
+MONTE CARLO DURATION + BARRIER SELECTION
+-----------------------------------------
+Neither the duration nor the barrier is hardcoded. For whichever contract
+the regime read selects, the bot:
+  1. Estimates live tick volatility (rolling std of log returns).
+  2. Simulates thousands of GBM-style price paths at each candidate
+     duration.
+  3. For NO TOUCH: picks the barrier distance (path-dependent - the
+     simulation tracks the running min/max of every path) that puts
+     P(no touch) at the target confidence level.
+  4. For EXPIRY RANGE: picks the barrier width (terminal-value only -
+     ends-in-range only cares where the path finishes, not what it
+     touched along the way) that puts P(ends inside range) at the target
+     confidence level.
+  5. Confirms the surviving candidates against Deriv's LIVE proposal
+     price (simulated probability != Deriv's priced payout) and buys
+     whichever (duration, barrier) combination has the best expected
+     value, never just the "safest" one.
 
-UPGRADE 3 — Confidence Calibration (temperature scaling + isotonic).
-  Raw model confidence scores are systematically overconfident (live logs
-  showed parametric MC at 0.92 vs bootstrap at 0.50). Temperature scaling
-  recalibrates so 80% confidence → ~80% actual win rate. Isotonic
-  regression provides a monotonic fallback for non-monotonic curves.
-  Directly fixes Kelly stake over-sizing from uncalibrated confidence.
+Duration floors (per your spec):
+  EXPIRY RANGE : >= 2 minutes
+  NO TOUCH     : >  2 minutes (starts at 3 minutes)
 
-UPGRADE 4 — Event-Driven Recalibration.
-  Fixed 2-hour timer replaced by drift-score trigger. Recalibration fires
-  on genuine model degradation, not the clock. 6-hour absolute backstop
-  prevents indefinite stale-model running. Reduces unnecessary compute
-  during stable regimes and responds faster during actual regime shifts.
+MONEY MANAGEMENT (ported 1:1 from the original bot's variables)
+-----------------------------------------------------------------
+  First Stake, Martingale Factor, Martingale Level ("Do Martingale After"),
+  Target Profit, Stop Loss - same semantics as the Blockly bot: on a loss,
+  stake is multiplied by the martingale factor for up to N steps; on a win,
+  stake resets to First Stake. The bot stops once cumulative profit hits
+  +Target Profit or -Stop Loss.
 
-UPGRADE 5 — Portfolio Risk Allocation.
-  Best-signal-wins replaced by simultaneous multi-symbol allocation.
-  Each symbol's stake = kelly_fraction × edge × (1 - correlation_penalty).
-  Correlated symbol pairs (e.g. R_75 + R_100) share reduced combined
-  allocation; genuinely uncorrelated pairs (R_10 + R_100) get near-full
-  allocation each. Max 3 concurrent positions, total risk capped at 6%
-  of balance. Enforced by PortfolioAllocator class.
+CONNECTION LAYER
+-----------------
+Reused verbatim from deriv_multisymbol_bot.py: REST OTP bootstrap against
+the new Deriv Options API, auto-reconnecting WebSocket client with
+exponential backoff and subscription replay.
 
+ENV VARS
+---------
+  DERIV_APP_ID        - your app_id from developers.deriv.com
+  DERIV_API_TOKEN     - API token for your Deriv account
+  DERIV_ACCOUNT_TYPE  - "demo" (default) or "real"
+  DERIV_ACCOUNT_ID    - optional, skips the accounts lookup
 
-v2 FIXES (applied 2026-06-29 from live log + Supabase analysis):
-─────────────────────────────────────────────────────────────────
-FIX 1 — hurst_rs() now computed on LOG-RETURNS not absolute prices.
-         Root cause of H=1.0 on every tick, which caused hurst_signal=+1.0
-         always and forced momentum_mode=True permanently, injecting a
-         structural CALL-only bias into every Bayesian fusion.
-
-FIX 2 — hmm_trend_weight() lean now normalised by return std.
-         HMM state means are O(1e-4) for synthetic index returns; tanh(1e-4
-         × 200) ≈ 0.02 — the HMM layer was effectively silent. Normalising
-         by std makes the signal dimensionless and reaches ±1 naturally.
-
-FIX 3 — compute_adx() trend threshold lowered 20 → 12 for tick data.
-         Tick-level ADX on synthetics rarely exceeds 20, so trend_strength
-         was permanently 0 and adx_dir contributed nothing to the gate.
-
-FIX 4 — momentum_mode h-threshold raised 0.52 → 0.58.
-         True random-walk synthetics have H ≈ 0.50 ± 0.05 on returns.
-         The 0.52 threshold was inside measurement noise, enabling spurious
-         momentum mode even on genuinely mean-reverting regimes.
-
-FIX 5 — Direction balance correction in bayesian_fusion().
-         When recent CALL/PUT ratio exceeds 80/20, a soft log-odds penalty
-         (capped at ±0.5) dampens runaway one-sided bias as a safety net.
-
-FIX 6 — MARTINGALE_MAX_STEPS reduced 3 → 2 + MAX_SEQUENCE_LOSS_PCT guard.
-         3-step martingale at 2% risk could consume 11.4% of balance per
-         failed sequence. Hard cap at 5% of balance aborts the sequence
-         before it can destroy the account. This is the structural fix for
-         the $12,000 → $7.54 account destruction.
-
-FIX 7 — POST_LOSS_DEEP_RECAL disabled (False).
-         Every loss was triggering 688-second full recalibration (11.5 min),
-         locking trading after each of the 41% losing trades. The scheduled
-         2-hour recal is sufficient; per-loss recal was redundant and was
-         calibrating on corrupted Hurst features anyway.
-
-FIX 8 — MIN_EXP_WIN_RATE lowered 0.52 → 0.505.
-         MC was blocking 186 signals because genuine random-walk synthetics
-         only simulate to ~0.50-0.51. The layer gate does primary selection;
-         MC's role is to pick the best duration, not gate the trade.
-
-FIX 9 — MC_SIMULATIONS reduced 50000 → 8000.
-         Statistical error at 8000 paths = ±0.006, sufficient to distinguish
-         0.52 from 0.505. Reduces calibration time by ~80%.
-
-FIX 10 — Walk-forward folds 5 → 3, step 3 → 5.
-          Cuts calibration wall time from ~688s to ~200-250s.
-
-FIX 11 — Direction history tracking (last 30 trades) for bias monitoring.
-          Logs a warning when CALL/PUT ratio exceeds 80/20.
-
-MODEL FITTING vs LIVE SCORING
-------------------------------
-Fitting HMM/GARCH/Hawkes/OU is computationally expensive, so it only happens
-during calibration: once at startup (full universe), then every 2 hours
-(top-K deep dive) or after 2 consecutive losses on a symbol (rate-limited,
-that symbol's deep dive). Live trading between calibrations just evaluates
-the cached fitted models against new ticks - cheap, fast, no refitting.
-
-Symbols without a fitted model yet (before their first calibration) return
-no signal and are simply not eligible for selection - this is automatic
-and correct, no special-casing needed.
-
-CONNECTION: new Deriv Options API (REST OTP bootstrap), verified against
-developers.deriv.com as of 2026-06:
-    REST  GET  /trading/v1/options/accounts            -> resolve account_id
-    REST  POST /trading/v1/options/accounts/{id}/otp    -> pre-auth WS URL
-    No `authorize` message needed - the OTP URL is already authenticated.
-    OTP tokens are short-lived/single-use, so a fresh one is fetched on
-    every (re)connect; the client auto-reconnects with backoff and replays
-    subscriptions (balance + ticks for every symbol) after each reconnect.
-    `active_symbols` no longer accepts `product_type`; its response field
-    is `underlying_symbol` (not `symbol`). `contracts_for` no longer takes
-    `currency`. Buy `parameters` now requires `underlying_symbol` (not
-    `symbol`). Tick responses keep the `symbol` field unchanged.
-
-ENV VARS REQUIRED:
-    DERIV_APP_ID        - your app_id from a NEW developers.deriv.com application
-                           (legacy app_ids, e.g. the old demo id 1089, do NOT
-                           work with the new Options API)
-    DERIV_API_TOKEN     - API token (personal access token) for your Deriv account
-    DERIV_ACCOUNT_TYPE  - "demo" (default, safe) or "real". Picked explicitly
-                           rather than guessed, so the bot never trades on
-                           your real-money account by accident.
-    DERIV_ACCOUNT_ID    - optional; skips the accounts lookup and uses this
-                           account_id directly
-
-SUPABASE PERSISTENCE (Railway has no persistent filesystem):
-    SUPABASE_URL        - e.g. https://xxxxxxxxxxxx.supabase.co
-    SUPABASE_KEY        - service_role key from Supabase Settings → API
-
-    Run this SQL once in Supabase SQL editor before first Railway deploy:
-
-        CREATE TABLE IF NOT EXISTS bot_trade_log (
-            id          BIGSERIAL PRIMARY KEY,
-            ts          TIMESTAMPTZ DEFAULT now(),
-            symbol      TEXT,
-            direction   INTEGER,
-            step        INTEGER,
-            stake       REAL,
-            won         BOOLEAN,
-            profit      REAL,
-            p_up        REAL,
-            confidence  REAL,
-            duration    INTEGER,
-            layer_votes JSONB,
-            n_agree     INTEGER,
-            n_disagree  INTEGER
-        );
-
-        CREATE TABLE IF NOT EXISTS bot_symbol_state (
-            symbol         TEXT PRIMARY KEY,
-            reliability    REAL,
-            threshold      REAL,
-            step0_wins     INTEGER DEFAULT 0,
-            step0_total    INTEGER DEFAULT 0,
-            layer_weights  JSONB  DEFAULT '{}',
-            payout_history JSONB  DEFAULT '[]',
-            updated_at     TIMESTAMPTZ DEFAULT now()
-        );
-
-        CREATE TABLE IF NOT EXISTS bot_global_state (
-            key        TEXT PRIMARY KEY,
-            value      JSONB,
-            updated_at TIMESTAMPTZ DEFAULT now()
-        );
-
-        CREATE TABLE IF NOT EXISTS bot_gate_config (
-            key        TEXT PRIMARY KEY,
-            value      REAL,
-            updated_at TIMESTAMPTZ DEFAULT now()
-        );
+  SYMBOLS             - comma-separated list, default "R_10,R_25,R_50,R_75,R_100"
+  TARGET_PROFIT       - default 5
+  STOP_LOSS           - default 25
+  FIRST_STAKE         - default 1
+  MARTINGALE_FACTOR   - default 3.1   (matches the original bot's default)
+  MARTINGALE_LEVEL    - default 3     (max martingale steps)
+  MC_TARGET_PROB      - default 0.70  (Monte Carlo confidence target)
 """
 
 import asyncio
-import io
 import json
 import os
 import random
 import sys
 import time
-import math
-import contextlib
-import warnings
+from collections import deque, defaultdict
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List, Tuple
+
 import numpy as np
 import requests
 import websockets
-from collections import deque, defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Optional, Dict, List, Tuple
-
-from scipy.optimize import minimize
-from scipy.stats import rankdata, norm, ks_2samp
-from scipy.special import expit as sigmoid
-from statsmodels.tsa.ar_model import AutoReg
-from hmmlearn.hmm import GaussianHMM
-from arch import arch_model
-
-warnings.filterwarnings("ignore")
-
-# ── Logging control ────────────────────────────────────────────────────────
-# Set VERBOSE_LOGS=1 in Railway env vars for full debug output.
-# Default (0) = quiet mode: only signal found, entry, result, errors.
-# No redeploy needed — Railway picks up env var changes on next restart.
-VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "0").strip() == "1"
-
-def vlog(*args, **kwargs):
-    """Verbose-only print — silent unless VERBOSE_LOGS=1."""
-    if VERBOSE_LOGS:
-        print(*args, **kwargs)
 
 # ---------------------------------------------------------------------------
-# CONFIG  (tune via your own walk-forward results before scaling up stakes)
+# CONFIG
 # ---------------------------------------------------------------------------
-DERIV_APP_ID = os.getenv("DERIV_APP_ID", "")
-DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
+DERIV_APP_ID       = os.getenv("DERIV_APP_ID", "")
+DERIV_API_TOKEN    = os.getenv("DERIV_API_TOKEN")
 DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo").strip().lower()
-DERIV_ACCOUNT_ID = os.getenv("DERIV_ACCOUNT_ID") or None
+DERIV_ACCOUNT_ID   = os.getenv("DERIV_ACCOUNT_ID") or None
 
-# ── Supabase persistence (Railway has no persistent filesystem) ──
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-
-# ── Connection (new Deriv Options API) ──
-API_BASE = "https://api.derivws.com"
+API_BASE      = "https://api.derivws.com"
 ACCOUNTS_PATH = "/trading/v1/options/accounts"
-OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
+OTP_PATH      = "/trading/v1/options/accounts/{account_id}/otp"
 
-MIN_STAKE = 0.35
-STAKE_PCT = 0.02
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "R_10,R_25,R_50,R_75,R_100").split(",") if s.strip()]
 
-MARTINGALE_FACTOR    = 1.29
-MARTINGALE_MAX_STEPS = 3
+CANDLE_INTERVAL_SEC = 60          # same candle interval as the original bot
+EMA_FAST = 7
+EMA_SLOW = 14
+ADX_PERIOD = 14
+ADX_TREND_THRESHOLD = 20          # >= this -> trending regime -> NO TOUCH
+EMA_GAP_TREND_PCT = 0.0015        # |EMA7-EMA14| / price >= this also counts as trending
 
-# ── v3b: Trade frequency control ──────────────────────────────────────────
-# 60 seconds prevents genuine same-tick double-entry while letting
-# independent signals through. Quality gates — not the clock — throttle.
-MIN_TRADE_COOLDOWN = 60
+# Money management (mirrors the original bot's block-defined defaults)
+TARGET_PROFIT     = float(os.getenv("TARGET_PROFIT", "5"))
+STOP_LOSS         = abs(float(os.getenv("STOP_LOSS", "25")))
+FIRST_STAKE       = float(os.getenv("FIRST_STAKE", "1"))
+MARTINGALE_FACTOR = float(os.getenv("MARTINGALE_FACTOR", "3.1"))
+MARTINGALE_LEVEL  = int(float(os.getenv("MARTINGALE_LEVEL", "3")))
+MIN_STAKE         = 0.35
 
-# ── v3b: Recovery timeout ─────────────────────────────────────────────────
-RECOVERY_ABANDON_AFTER = 20 * 60
+# Monte Carlo
+MC_SIMULATIONS   = int(os.getenv("MC_SIMULATIONS", "8000"))
+MC_TARGET_PROB   = float(os.getenv("MC_TARGET_PROB", "0.70"))   # confirmed with you: 70%
+MC_SIGMA_GRID    = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
 
-# ── Quality gates ──────────────────────────────────────────────────────────
-MIN_SCORE_GAP = 0.05
+# Duration floors per your spec (minutes)
+EXPIRYRANGE_MIN_MINUTES = 2
+NOTOUCH_MIN_MINUTES     = 3       # "more than 2 minutes"
+EXPIRYRANGE_DURATIONS   = [2, 3, 5, 7, 10, 15]
+NOTOUCH_DURATIONS       = [3, 5, 7, 10, 15, 20, 30]
 
-GATE_SCHEMA_VERSION = 4
-
-# ── Layer agreement gate ──────────────────────────────────────────────────
-# 9/4 confirmed by actual log data (2026-06-30): signal distribution
-# clustered at 9-10 agree. At 10/3 only 17% of candidates pass the first
-# gate. At 9/4, 38% pass — and the entropy gate + confluence then do the
-# real quality filtering on that larger pool. The quality throttle is the
-# combination of ALL gates, not this one gate alone.
-MIN_LAYER_AGREE    = 9
-MAX_LAYER_DISAGREE = 4
-
-# FIX v2: Hard cap on total stake committed in one martingale sequence.
-# If the cumulative at-risk amount would exceed this fraction of balance,
-# abort the recovery rather than place the next step.
-# This would have prevented the account destruction: the bot kept recovering
-# at growing stakes while balance fell, compounding losses.
-MAX_SEQUENCE_LOSS_PCT = 0.05           # Never risk more than 5% of balance in one sequence
-
-SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds — full deep recal every 2 hours
-SCHEDULED_CALIBRATION_INTERVAL = 6 * 60 * 60   # 6-hour absolute backstop (v2 compat line)
-HISTORY_BOOTSTRAP_COUNT = 10000                # ticks fetched per symbol at startup
-
-CONFIDENCE_THRESHOLD_DEFAULT = 0.11    # fallback only — real threshold set adaptively
-                                        # (see ADAPTIVE_THRESHOLD_PERCENTILE below)
-
-# (duplicate block removed — see definitions above)
-
-# ── Monte Carlo quality floor ─────────────────────────────────────────────
-# FIX v2: Lowered from 0.52 → 0.505. The MC was blocking 186 signals because
-# genuine random-walk synthetics only produce ~0.50-0.51 from simulation.
-# The real edge comes from the layer stack, not the MC simulation alone.
-# 0.505 filters out clearly negative-edge scenarios while allowing the
-# layer-quality gate to do the primary selection work.
-MIN_EXP_WIN_RATE = 0.505
-
-# ── Adaptive threshold percentile ─────────────────────────────────────────
-ADAPTIVE_THRESHOLD_PERCENTILE = 75
-
-# ── Post-loss deep recalibration ──────────────────────────────────────────
-# FIX v2: Disabled POST_LOSS_DEEP_RECAL.
-# Every loss was triggering a 688-second full recalibration, meaning the bot
-# spent 11.5 minutes locked after EVERY single lost trade. At 41% loss rate
-# that's ~28 minutes of downtime per hour. Also the deep recal was supposed
-# to improve models but the broken Hurst meant it was calibrating on corrupted
-# features. Use scheduled 2-hour recal only — sufficient for synthetics.
-POST_LOSS_DEEP_RECAL = False
-CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]
-
-# FIX v2: Reduced MC_SIMULATIONS from 50000 → 8000.
-# The calibration wall time was 688 seconds (11.5 min) for 8 symbols.
-# MC is used to select the best duration among 5 candidates on random-walk
-# synthetics where the true win rate is ~0.50 ± 0.02. 8000 paths gives a
-# standard error of sqrt(0.5*0.5/8000) = 0.0056 — more than sufficient to
-# distinguish 0.52 from 0.51 with high confidence. This reduces calibration
-# time by ~80% while retaining statistical validity.
-MC_SIMULATIONS = 8000
-
-WATCHDOG_TIMEOUT = 5 * 60
-WATCHDOG_CHECK_INTERVAL = 20
-
-MIN_TICKS_FOR_FIT = 200
-MIN_TICKS_LIVE = 60
-
-# ── v3: Event-driven recalibration — replaces fixed 2-hour timer ──────────
-# Recalibration fires when ANY drift detector exceeds its threshold.
-# SCHEDULED_CALIBRATION_INTERVAL is now a maximum backstop, not a trigger.
-SCHEDULED_CALIBRATION_INTERVAL = 6 * 60 * 60   # 6-hour absolute backstop
-# FIX v3b: Raised from 5 → 30 minutes. 5-min cooldown caused perpetual
-# recal loop — drift fired within 10 heartbeats (5 min) after EVERY
-# calibration, giving the bot zero trading time in 10.5 hours (confirmed in logs).
-CALIBRATION_COOLDOWN = 30 * 60
-
-# Additional blackout after calibration during which drift checks are
-# completely suppressed — prevents KS from immediately flagging fresh
-# reference vs. live ticks that advanced during calibration duration.
-POST_CALIBRATION_DRIFT_BLACKOUT = 20 * 60   # 20 min post-cal drift silence
-
-# ── v3: Drift detection thresholds ────────────────────────────────────────
-# FIX v3b: KS raised 0.02 → 0.005. Even 0.02 was too sensitive, firing within
-# minutes after every calibration. p < 0.005 requires strong distributional
-# evidence before flagging drift — correct for 500-tick comparison windows.
-KS_P_THRESHOLD        = 0.005
-
-# FIX v3b: PSI raised 0.20 → 0.30. 0.20 fires on normal model output variation.
-# 0.30 requires genuine population shift.
-PSI_THRESHOLD         = 0.30
-
-CUSUM_THRESHOLD       = 4.0
-CUSUM_DRIFT           = 0.03
-
-DRIFT_STAKE_REDUCTION = 0.50
-
-# ── v3: Meta-learner settings ─────────────────────────────────────────────
-META_MIN_SAMPLES      = 200    # minimum resolved trades before meta-learner activates
-META_LEARNING_RATE    = 0.10   # logistic regression online update rate
-META_L2               = 0.01   # L2 regularisation weight
-
-# ── v3: Portfolio allocation settings ─────────────────────────────────────
-PORTFOLIO_MAX_CONCURRENT   = 3      # max simultaneous open positions
-PORTFOLIO_MAX_TOTAL_RISK   = 0.06   # max 6% of balance at risk across all open positions
-PORTFOLIO_CORR_WINDOW      = 500    # ticks of returns used for correlation estimation
-PORTFOLIO_HIGH_CORR        = 0.40   # above this → correlation penalty applies
+TRADE_COOLDOWN_SEC = 30           # avoid re-entering on every single new candle
+CANDIDATE_TOP_K     = 6           # how many MC candidates get a live quote check
 
 
 # ---------------------------------------------------------------------------
-# SUPABASE PERSISTENCE STORE
-# Railway's filesystem is ephemeral — every restart wipes in-memory state.
-# SupabaseStore is the single exit point for all learned state: layer weights,
-# per-symbol thresholds, reliability scores, win counts, and trade history.
-# All methods are synchronous (requests) so they run during calibration pauses.
-# Failures are always swallowed — the bot degrades to in-memory-only if down.
-# ---------------------------------------------------------------------------
-class SupabaseStore:
-    def __init__(self):
-        self.url = SUPABASE_URL
-        self.key = SUPABASE_KEY
-        self.ok  = bool(self.url and self.key)
-        if self.ok:
-            print(f"[Store] Supabase persistence active → {self.url}")
-        else:
-            print("[Store] SUPABASE_URL / SUPABASE_KEY not set — "
-                  "learned state will NOT persist across Railway restarts.")
-
-    def _headers(self, prefer="return=minimal"):
-        return {"apikey": self.key, "Authorization": f"Bearer {self.key}",
-                "Content-Type": "application/json", "Prefer": prefer}
-
-    def _upsert(self, table, payload):
-        if not self.ok: return
-        try:
-            r = requests.post(f"{self.url}/rest/v1/{table}",
-                              headers=self._headers("resolution=merge-duplicates,return=minimal"),
-                              json=payload, timeout=10)
-            if r.status_code not in (200, 201, 204):
-                print(f"[Store] {table} upsert {r.status_code}: {r.text[:160]}")
-        except Exception as e:
-            print(f"[Store] {table} upsert failed: {e}")
-
-    def _insert(self, table, payload):
-        if not self.ok: return
-        try:
-            r = requests.post(f"{self.url}/rest/v1/{table}",
-                              headers=self._headers(), json=payload, timeout=10)
-            if r.status_code not in (200, 201, 204):
-                print(f"[Store] {table} insert {r.status_code}: {r.text[:160]}")
-        except Exception as e:
-            print(f"[Store] {table} insert failed: {e}")
-
-    def _select(self, table, query="select=*"):
-        if not self.ok: return []
-        try:
-            r = requests.get(f"{self.url}/rest/v1/{table}?{query}",
-                             headers=self._headers("return=representation"), timeout=12)
-            if r.status_code == 200: return r.json()
-            print(f"[Store] {table} select {r.status_code}: {r.text[:160]}")
-        except Exception as e:
-            print(f"[Store] {table} select failed: {e}")
-        return []
-
-    def save_trade(self, symbol, direction, step, stake, won, profit,
-                   p_up, confidence, duration, feats):
-        votes = {}
-        if feats:
-            votes = {
-                "markov":    round((feats.get("markov_p",     0.5) - 0.5) * 2, 4),
-                "hmm":       round(feats.get("hmm_lean",      0), 4),
-                "hawkes":    round(feats.get("hawkes",         0), 4),
-                "ou":        round(feats.get("ou_dir",         0) * feats.get("ou_strength", 0), 4),
-                "hurst":     round(feats.get("hurst_signal",   0), 4),
-                "arfima":    round(feats.get("arfima_bias",    0), 4),
-                "kalman":    round(feats.get("kalman",         0), 4),
-                "regime":    round(feats.get("regime_strength", 0.0), 4),
-                "rsi":       round(feats.get("rsi_signal",     0), 4),
-                "srsi":      round(feats.get("srsi_signal",    0), 4),
-                "adx":       round(feats.get("adx_dir",        0) * feats.get("adx_trend", 0), 4),
-                "boll":      round(feats.get("boll_signal",    0), 4),
-                "zscore":    round(feats.get("z_signal",       0), 4),
-                "vol_regime":round(feats.get("vol_regime",    0.0), 4),
-                "divergence":round(feats.get("div_signal",    0.0), 4),
-                "jump":      round(feats.get("jump_dir",       0) * feats.get("jump_intensity", 0), 4),
-                "post_jump": round(feats.get("post_jump",      0) * feats.get("jump_intensity", 0), 4),
-                "momentum_mode": int(feats.get("momentum_mode", False)),
-            }
-        self._insert("bot_trade_log", {
-            "ts": datetime.utcnow().isoformat(), "symbol": symbol,
-            "direction": int(direction), "step": int(step),
-            "stake": round(float(stake), 4), "won": bool(won),
-            "profit": round(float(profit), 4), "p_up": round(float(p_up), 6),
-            "confidence": round(float(confidence), 6), "duration": int(duration),
-            "layer_votes": json.dumps(votes),
-            "n_agree":    int(feats.get("agree_up",    0)) if feats else 0,
-            "n_disagree": int(feats.get("disagree_up", 0)) if feats else 0,
-        })
-
-    def save_symbol_state(self, state):
-        for s, m in state.model_cache.items():
-            self._upsert("bot_symbol_state", {
-                "symbol":         s,
-                "reliability":    round(float(state.reliability.get(s, 1.0)), 6),
-                "threshold":      round(float(state.per_symbol_threshold.get(s, state.adaptive_threshold)), 6),
-                "step0_wins":     int(state.step0_wins.get(s, 0)),
-                "step0_total":    int(state.step0_total.get(s, 0)),
-                "layer_weights":  json.dumps(m.per_layer_weights or {}),
-                # FIX v2: persist the rolling Kelly payout history per symbol
-                # so quarter-Kelly sizing doesn't reset to the conservative
-                # default on every Railway restart/redeploy.
-                "payout_history": json.dumps(state.payout_history.get(s, [])[-50:]),
-                "updated_at":     datetime.utcnow().isoformat(),
-            })
-        print(f"[Store] Saved state for {len(state.model_cache)} symbols to Supabase.")
-
-    def load_symbol_state(self, state):
-        rows = self._select("bot_symbol_state")
-        if not rows:
-            print("[Store] No prior symbol state found — cold start.")
-            return
-        if not hasattr(state, '_pending_weights'):
-            state._pending_weights = {}
-        for row in rows:
-            s = row["symbol"]
-            state.reliability[s]          = float(row.get("reliability", 1.0))
-            state.per_symbol_threshold[s] = float(row.get("threshold",   state.adaptive_threshold))
-            state.step0_wins[s]           = int(row.get("step0_wins",   0))
-            state.step0_total[s]          = int(row.get("step0_total",  0))
-            raw_w = row.get("layer_weights") or "{}"
-            weights = json.loads(raw_w) if isinstance(raw_w, str) else (raw_w or {})
-            if weights:
-                state._pending_weights[s] = weights
-            # FIX v2: restore Kelly payout history
-            raw_p = row.get("payout_history") or "[]"
-            payouts = json.loads(raw_p) if isinstance(raw_p, str) else (raw_p or [])
-            if payouts:
-                state.payout_history[s] = payouts
-        print(f"[Store] Warm-started state for {len(rows)} symbols from Supabase.")
-
-
-    def save_global_state(self, state):
-        """Persist global (non-per-symbol) self-improvement state.
-        FIX v3: also persist balance peak for drawdown tracking.
-        Previously only saved after trade closes — with only 3 trades in the
-        session, direction_history only had 3 entries in Supabase. Now called
-        periodically by the heartbeat so the window stays warm across restarts."""
-        hist = list(state.direction_history)[-30:]
-        self._upsert("bot_global_state", {
-            "key":        "direction_history",
-            "value":      json.dumps(hist),
-            "updated_at": datetime.utcnow().isoformat(),
-        })
-
-    def load_global_state(self, state):
-        rows = self._select("bot_global_state", "select=key,value")
-        for row in rows:
-            if row["key"] == "direction_history":
-                raw = row.get("value") or "[]"
-                # Supabase may return JSONB as already-parsed list or as string
-                if isinstance(raw, str):
-                    try:
-                        hist = json.loads(raw)
-                    except Exception:
-                        hist = []
-                elif isinstance(raw, list):
-                    hist = raw
-                else:
-                    hist = []
-                # Ensure all entries are plain Python ints
-                hist = [int(d) for d in hist if d in (1, -1)]
-                if hist:
-                    state.direction_history = hist[-30:]
-                    print(f"[Store] Restored direction_history "
-                          f"({len(state.direction_history)} entries, "
-                          f"call_ratio={sum(1 for d in hist if d==1)/len(hist):.0%}).")
-
-    # FIX v2: Schema version stamp on saved gates.
-    # Without this, a gate row saved by an OLDER bot version (e.g. the
-    # original pre-multi-gate-stack bot) silently overrides the new
-    # hardcoded defaults on every restart via load_gates() below — exactly
-    # what happened after the v2 deploy: logs showed "need >=11 agree" even
-    # though v2.py hardcodes MIN_LAYER_AGREE=12, because the stale value from
-    # a previous run's autotune_gates() was still sitting in bot_gate_config.
-    # Bump GATE_SCHEMA_VERSION any time the gate stack's semantics change
-    # (e.g. adding/removing a sequential filter) to force a clean reset.
-    def save_gates(self, min_agree, max_disagree, min_exp_wr, adaptive_thr):
-        for key, val in [("min_layer_agree",    float(min_agree)),
-                         ("max_layer_disagree", float(max_disagree)),
-                         ("min_exp_win_rate",   float(min_exp_wr)),
-                         ("adaptive_threshold", float(adaptive_thr)),
-                         ("gate_schema_version", float(GATE_SCHEMA_VERSION))]:
-            self._upsert("bot_gate_config", {"key": key, "value": round(val, 6),
-                                              "updated_at": datetime.utcnow().isoformat()})
-
-    def load_gates(self):
-        rows = self._select("bot_gate_config", "select=key,value")
-        gates = {row["key"]: float(row["value"]) for row in rows}
-        saved_version = gates.get("gate_schema_version", -1)
-        if saved_version != GATE_SCHEMA_VERSION:
-            print(f"[Store] Gate config schema mismatch "
-                  f"(saved={saved_version}, current={GATE_SCHEMA_VERSION}) — "
-                  f"ignoring stale persisted gates, using code defaults.")
-            return {}
-        return gates
-
-
-# Module-level store singleton — instantiated once in main()
-_store: Optional[SupabaseStore] = None
-
-
-# ---------------------------------------------------------------------------
-# SHARED STATE  (single source of truth - every module reads/writes through this)
-# ---------------------------------------------------------------------------
-class TradeState:
-    def __init__(self):
-        self.balance = 0.0
-        self.trading_locked = False
-        self.trade_in_progress = False
-        self.consecutive_losses = defaultdict(int)
-        self.reliability = defaultdict(lambda: 1.0)
-        self.loss_triggered_calibrations_24h = deque()
-        self.last_scheduled_calibration = time.time()
-        self.last_calibration_end = 0.0
-        self.model_cache: Dict[str, "SymbolModels"] = {}
-        self.last_activity = time.time()
-
-        # Threshold: per-symbol, derived from each symbol's own OOS confidence
-        # distribution during deep calibration. Falls back to global default
-        # only for symbols not yet calibrated.
-        self.adaptive_threshold = CONFIDENCE_THRESHOLD_DEFAULT   # global fallback
-        self.per_symbol_threshold: Dict[str, float] = {}
-
-        # Martingale recovery context — saved between main-loop iterations so
-        # each recovery step waits for a genuine signal, not an instant re-entry
-        # Recovery state — NO symbol/direction lock. After a loss the bot
-        # recalibrates then re-enters the open scan at the elevated stake.
-        # recovery_step=0 means not in recovery. recovery_step>=1 means
-        # we are in a martingale sequence at that step number.
-        self.recovery_step      = 0
-        self.recovery_stake     = 0.0
-
-        # FIX v2: Track stake committed so far in the current martingale
-        # sequence. Abort if cumulative risk exceeds MAX_SEQUENCE_LOSS_PCT.
-        self.seq_stakes_committed = 0.0
-
-        # FIX v2: Direction balance tracking.
-        # A rolling window of the last 30 trade directions (+1=CALL, -1=PUT).
-        # Used to compute recent_call_ratio, which bayesian_fusion uses to
-        # apply a soft correction when the model is one-sided.
-        self.direction_history: list = []  # deque-style, max 30 entries
-
-        # FIX v2: Rolling payout ratio tracking (per symbol) for Kelly sizing.
-        # Deriv Rise/Fall payout varies by symbol/duration/volatility regime,
-        # so it must be measured empirically rather than assumed. Stores the
-        # last 50 winning trades' (profit / stake) ratio per symbol.
-        self.payout_history: Dict[str, list] = defaultdict(list)
-
-        # Step-0 (raw signal, no martingale recovery) win-rate tracking —
-        # the only metric that honestly reveals whether the signal has edge
-        self.step0_wins   = defaultdict(int)
-        self.step0_total  = defaultdict(int)
-
-        # FIX v3: Session-only trade counter for autotune guard.
-        # Resets to 0 on every startup — intentionally NOT loaded from Supabase.
-        # autotune_gates() only tunes when this reaches 30+ so it never fires
-        # on stale historical step0 counts from previous broken-layer sessions.
-        self._session_trades = 0
-
-        # v3b: Trade cooldown — timestamp of last step-0 entry
-        self.last_step0_time: float = 0.0
-        # v3b: Recovery start time — when recovery was armed
-        self.recovery_start_time: float = 0.0
-
-        # Self-improvement bookkeeping
-        self._pending_weights: Dict[str, dict] = {}
-        self._trades_since_autotune = 0
-
-        # ── v3: Drift detection state ─────────────────────────────────────
-        # Per-symbol training return window (snapshot at calibration time)
-        # used as the reference distribution for KS and PSI tests.
-        self.drift_reference_returns: Dict[str, np.ndarray] = {}
-        # Per-symbol confidence score history for PSI
-        self.drift_confidence_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
-        # Per-symbol CUSUM accumulators
-        self.cusum_stat: Dict[str, float] = defaultdict(float)
-        # Whether a symbol is currently in a degraded-model state
-        self.drift_degraded: Dict[str, bool] = defaultdict(bool)
-        # Last drift check timestamp per symbol
-        self.last_drift_check: Dict[str, float] = defaultdict(float)
-
-        # ── v3: Meta-learner state ────────────────────────────────────────
-        # Per-symbol logistic regression weights over the 16 layer outputs.
-        # None = not enough data yet, falls back to Bayesian fusion.
-        self.meta_weights: Dict[str, np.ndarray] = {}
-        self.meta_bias:    Dict[str, float]       = {}
-        # Ring buffer of (layer_vector, outcome) training examples per symbol
-        self.meta_buffer:  Dict[str, deque] = defaultdict(lambda: deque(maxlen=2000))
-
-        # ── v3: Confidence calibration state ─────────────────────────────
-        # Temperature parameter per symbol (>1 = soften, <1 = sharpen).
-        # Isotonic mapping (sorted confidence bins → win rates) as fallback.
-        self.cal_temperature: Dict[str, float]         = defaultdict(lambda: 1.0)
-        self.cal_isotonic:    Dict[str, Optional[object]] = defaultdict(lambda: None)
-
-        # ── v3: Portfolio state ───────────────────────────────────────────
-        # Active positions: symbol → {direction, stake, open_time}
-        self.open_positions: Dict[str, dict] = {}
-        # Recent return correlation matrix (updated after each calibration)
-        self.return_correlations: Dict[Tuple[str,str], float] = {}
-
-        # Sequence accumulator
-        self.seq_stakes    = []
-        self.seq_profits   = []
-        self.seq_balance_before = 0.0
-        self.seq_p_up      = 0.5
-        self.seq_confidence= 0.0
-        self.seq_duration  = 0
-
-
-@dataclass
-class SymbolModels:
-    fitted: bool = False
-    fitted_at: float = 0.0
-    origin_epoch: float = 0.0
-    tick_dt: float = 2.0             # actual measured dt at fit time, carried for re-use
-    hmm_model: Optional[object] = None
-    garch_result: Optional[object] = None
-    garch_scale: float = 1000.0
-    ou_params: Optional[dict] = None
-    hawkes_up: Optional[dict] = None
-    hawkes_up_events: Optional[np.ndarray] = None
-    hawkes_down: Optional[dict] = None
-    hawkes_down_events: Optional[np.ndarray] = None
-    # per-layer fusion weights learned from OOS correlation during deep calibration
-    # None means fall back to static defaults inside bayesian_fusion()
-    per_layer_weights: Optional[dict] = None
-
-
-class SymbolData:
-    def __init__(self, symbol, maxlen=12000, tick_dt=2.0):
-        self.symbol = symbol
-        self.tick_dt = tick_dt          # seconds per tick: 1.0 for 1HZ, ~2.0 for R_
-        self.ticks = deque(maxlen=maxlen)  # (epoch, price)
-
-    def add_tick(self, epoch, price):
-        self.ticks.append((epoch, price))
-
-    def prices(self):
-        return np.array([p for _, p in self.ticks], dtype=float)
-
-    def epochs(self):
-        return np.array([e for e, _ in self.ticks], dtype=float)
-
-    def returns(self):
-        p = self.prices()
-        if len(p) < 2:
-            return np.array([])
-        return np.diff(p) / p[:-1]
-
-    def mean_tick_dt(self):
-        """Compute actual mean inter-tick gap in seconds from the buffered epochs.
-        Used to verify the tick_dt assumption and for activity ranking."""
-        e = self.epochs()
-        if len(e) < 2:
-            return self.tick_dt
-        return float(np.mean(np.diff(e)))
-
-    def slice_copy(self, n):
-        """Returns a new SymbolData containing only the first n ticks, carrying
-        tick_dt through so re-fitted models use the correct rate."""
-        new_sd = SymbolData(self.symbol, maxlen=n + 10, tick_dt=self.tick_dt)
-        for e, p in list(self.ticks)[:n]:
-            new_sd.add_tick(e, p)
-        return new_sd
-
-
-# ---------------------------------------------------------------------------
-# DERIV API CLIENT - new Options API (REST OTP bootstrap, auto-reconnecting)
+# CONNECTION LAYER - reused from deriv_multisymbol_bot.py
 # ---------------------------------------------------------------------------
 class DerivClient:
     """
@@ -737,11 +144,11 @@ class DerivClient:
     .../accounts/{id}/otp -> pre-authenticated WS URL. No `authorize`
     message is sent or needed; the OTP URL is already scoped to the account.
 
-    OTP URLs are short-lived and single-use (per developers.deriv.com), so a
-    fresh one is fetched on every connect AND every reconnect. After the
-    first successful connect, this client auto-reconnects in the background
-    with exponential backoff and calls `resubscribe_cb` (if set) so the
-    caller can replay its balance/tick subscriptions.
+    OTP URLs are short-lived and single-use, so a fresh one is fetched on
+    every connect AND every reconnect. After the first successful connect,
+    this client auto-reconnects in the background with exponential backoff
+    and calls `resubscribe_cb` (if set) so the caller can replay its
+    balance/tick subscriptions.
     """
 
     HEARTBEAT_INTERVAL = 20
@@ -758,12 +165,11 @@ class DerivClient:
         self.pending = {}
         self.subscriptions = defaultdict(list)  # msg_type -> list[asyncio.Queue]
         self.account = None
-        self.resubscribe_cb = None  # async callable(client), replayed after reconnect
+        self.resubscribe_cb = None
         self._running = False
         self._reader_task = None
         self._ka_task = None
 
-    # ---- REST bootstrap ----
     def _rest_headers(self):
         return {
             "Authorization": f"Bearer {self.token}",
@@ -807,10 +213,7 @@ class DerivClient:
     async def _get_ws_url(self):
         return await asyncio.to_thread(self._fetch_otp_url_sync)
 
-    # ---- connection lifecycle ----
     async def connect(self):
-        """Connects once (raises on failure, so startup misconfiguration
-        fails fast) then runs the supervisor loop forever in the background."""
         self._running = True
         await self._connect_once()
         asyncio.create_task(self._supervise())
@@ -819,11 +222,6 @@ class DerivClient:
     async def _connect_once(self):
         ws_url = await self._get_ws_url()
         self.ws = await websockets.connect(ws_url, ping_interval=None, close_timeout=5)
-        # IMPORTANT: start the reader (and heartbeat) BEFORE sending anything.
-        # `send()` blocks on a future that is only resolved by `_dispatch()`,
-        # which only runs inside `_read_loop()`. If the reader isn't already
-        # running, the balance handshake below times out forever (this was
-        # the cause of a repeated TimeoutError/CancelledError crash loop).
         self._reader_task = asyncio.create_task(self._read_loop())
         self._ka_task = asyncio.create_task(self._heartbeat())
         bal = await self.send({"balance": 1})
@@ -841,13 +239,9 @@ class DerivClient:
             print(f"[DerivClient] WS connection lost: {e}")
 
     async def _supervise(self):
-        """Watches the current reader task; on disconnect, cleans up and
-        reconnects with exponential backoff, restarting reader+heartbeat
-        each time inside `_connect_once`."""
         while self._running:
             if self._reader_task is not None:
                 await self._reader_task
-
             if self._ka_task is not None:
                 self._ka_task.cancel()
             for fut in self.pending.values():
@@ -855,10 +249,8 @@ class DerivClient:
                     fut.set_exception(ConnectionError("Deriv WS disconnected"))
             self.pending.clear()
             self.ws = None
-
             if not self._running:
                 break
-
             attempt = 0
             while self._running and self.ws is None:
                 attempt += 1
@@ -891,20 +283,23 @@ class DerivClient:
             fut = self.pending.pop(req_id)
             if not fut.done():
                 fut.set_result(data)
-                return
+            return
         if msg_type in self.subscriptions:
             for q in self.subscriptions[msg_type]:
                 q.put_nowait(data)
 
     async def send(self, request, timeout=20):
         self.req_id += 1
-        rid = self.req_id
-        request = dict(request)
-        request["req_id"] = rid
+        req_id = self.req_id
+        request = {**request, "req_id": req_id}
         fut = asyncio.get_event_loop().create_future()
-        self.pending[rid] = fut
+        self.pending[req_id] = fut
         await self.ws.send(json.dumps(request))
-        return await asyncio.wait_for(fut, timeout=timeout)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self.pending.pop(req_id, None)
+            return {"error": {"message": "request timed out"}}
 
     def subscribe_channel(self, msg_type):
         q = asyncio.Queue()
@@ -912,187 +307,335 @@ class DerivClient:
         return q
 
 
+# ---------------------------------------------------------------------------
+# CANDLE / EMA / REGIME DATA
+# ---------------------------------------------------------------------------
+class SymbolCandles:
+    """Builds fixed-interval OHLC candles from the live tick stream and
+    keeps rolling EMA(7)/EMA(14) + tick buffers for Monte Carlo."""
 
-async def fetch_tradable_symbols(client):
-    """Fetches R_ volatility indices only (R_10/25/50/75/100).
-    Returns a list of verified CALL/PUT-eligible symbol names.
-    1HZ symbols are handled separately by select_top_1hz()."""
-    resp = await client.send({"active_symbols": "brief"})
-    if "error" in resp:
-        print(f"[fetch_tradable_symbols] active_symbols error: {resp['error']}")
+    def __init__(self, symbol, interval_sec=CANDLE_INTERVAL_SEC, maxlen=500):
+        self.symbol = symbol
+        self.interval = interval_sec
+        self.candles = deque(maxlen=maxlen)     # dicts: open/high/low/close/epoch
+        self.ticks = deque(maxlen=20000)        # (epoch, price) - for MC volatility
+        self._cur = None
+        self.ema_fast_list = deque(maxlen=maxlen)
+        self.ema_slow_list = deque(maxlen=maxlen)
+
+    def add_tick(self, epoch, price):
+        self.ticks.append((epoch, price))
+        bucket = int(epoch // self.interval) * self.interval
+        if self._cur is None or self._cur["epoch"] != bucket:
+            if self._cur is not None:
+                self._finish_candle(self._cur)
+            self._cur = {"epoch": bucket, "open": price, "high": price,
+                         "low": price, "close": price}
+        else:
+            self._cur["high"] = max(self._cur["high"], price)
+            self._cur["low"] = min(self._cur["low"], price)
+            self._cur["close"] = price
+
+    def _finish_candle(self, candle):
+        self.candles.append(dict(candle))
+        closes = [c["close"] for c in self.candles]
+        self.ema_fast_list.append(_ema_last(closes, EMA_FAST))
+        self.ema_slow_list.append(_ema_last(closes, EMA_SLOW))
+
+    def prices(self):
+        return np.array([p for _, p in self.ticks], dtype=float)
+
+    def returns(self):
+        p = self.prices()
+        if len(p) < 2:
+            return np.array([])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r = np.diff(np.log(p))
+        return r[np.isfinite(r)]
+
+    def ready(self):
+        return len(self.candles) >= EMA_SLOW + 2 and len(self.ticks) >= 100
+
+
+def _ema_last(values, period):
+    """EMA of `values` (list of closes) using the standard 2/(n+1) alpha,
+    seeded with an SMA of the first `period` values. Returns the last EMA
+    value only (this is called incrementally as candles close)."""
+    if len(values) < period:
+        return None
+    alpha = 2.0 / (period + 1)
+    ema = np.mean(values[:period])
+    for v in values[period:]:
+        ema = alpha * v + (1 - alpha) * ema
+    return ema
+
+
+def compute_adx(candles, period=ADX_PERIOD):
+    """Wilder's ADX from a list of OHLC candle dicts. Returns None if not
+    enough candles yet."""
+    if len(candles) < period + 1:
+        return None
+    highs = np.array([c["high"] for c in candles])
+    lows = np.array([c["low"] for c in candles])
+    closes = np.array([c["close"] for c in candles])
+
+    up_move = highs[1:] - highs[:-1]
+    down_move = lows[:-1] - lows[1:]
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = np.maximum.reduce([
+        highs[1:] - lows[1:],
+        np.abs(highs[1:] - closes[:-1]),
+        np.abs(lows[1:] - closes[:-1]),
+    ])
+
+    def wilder_smooth(arr, p):
+        sm = np.zeros(len(arr))
+        sm[p - 1] = arr[:p].sum()
+        for i in range(p, len(arr)):
+            sm[i] = sm[i - 1] - (sm[i - 1] / p) + arr[i]
+        return sm
+
+    if len(tr) < period:
+        return None
+    atr = wilder_smooth(tr, period)
+    plus_di = 100 * wilder_smooth(plus_dm, period) / np.where(atr == 0, 1e-9, atr)
+    minus_di = 100 * wilder_smooth(minus_dm, period) / np.where(atr == 0, 1e-9, atr)
+    dx = 100 * np.abs(plus_di - minus_di) / np.where((plus_di + minus_di) == 0, 1e-9, (plus_di + minus_di))
+    valid = dx[period - 1:]
+    if len(valid) == 0:
+        return None
+    return float(np.mean(valid[-period:]))
+
+
+@dataclass
+class RegimeRead:
+    trending: bool
+    adx: Optional[float]
+    ema_fast: float
+    ema_slow: float
+    ema_fast_prev: float
+    ema_slow_prev: float
+    cross_down_confirmed: bool     # mirrors the original bot's entry trigger
+    black_candle: bool
+
+
+def read_regime(sc: SymbolCandles) -> Optional[RegimeRead]:
+    if not sc.ready():
+        return None
+    ema_f = sc.ema_fast_list[-1]
+    ema_s = sc.ema_slow_list[-1]
+    ema_f_prev = sc.ema_fast_list[-2]
+    ema_s_prev = sc.ema_slow_list[-2]
+    if None in (ema_f, ema_s, ema_f_prev, ema_s_prev):
+        return None
+
+    adx = compute_adx(list(sc.candles))
+    price = sc.candles[-1]["close"]
+    gap_pct = abs(ema_f - ema_s) / price if price else 0.0
+
+    trending = (adx is not None and adx >= ADX_TREND_THRESHOLD) or (gap_pct >= EMA_GAP_TREND_PCT)
+
+    # Original bot's trigger: EMA(7) was above EMA(14) last candle, now below
+    # (a confirmed cross-down), plus the latest candle is black (bearish).
+    cross_down = (ema_f_prev > ema_s_prev) and (ema_f < ema_s)
+    last = sc.candles[-1]
+    black_candle = last["close"] < last["open"]
+
+    return RegimeRead(
+        trending=trending, adx=adx,
+        ema_fast=ema_f, ema_slow=ema_s,
+        ema_fast_prev=ema_f_prev, ema_slow_prev=ema_s_prev,
+        cross_down_confirmed=cross_down, black_candle=black_candle,
+    )
+
+
+# ---------------------------------------------------------------------------
+# MONTE CARLO - DURATION + BARRIER SELECTION
+# ---------------------------------------------------------------------------
+def _simulate_paths(vol_per_tick, n_ticks, n_sims=MC_SIMULATIONS):
+    """Simulates n_sims GBM-style log-return paths of n_ticks steps.
+    Returns (cum_log, running_max, running_min) arrays of shape (n_sims, n_ticks)."""
+    steps = np.random.normal(0.0, vol_per_tick, size=(n_sims, n_ticks))
+    cum_log = np.cumsum(steps, axis=1)
+    running_max = np.maximum.accumulate(cum_log, axis=1)
+    running_min = np.minimum.accumulate(cum_log, axis=1)
+    return cum_log, running_max, running_min
+
+
+def _tick_vol(returns):
+    if len(returns) < 20:
+        return None
+    window = returns[-200:] if len(returns) >= 200 else returns
+    vol = float(np.std(window))
+    return max(vol, 1e-7)
+
+
+def mc_select_notouch(sc: SymbolCandles, trend_is_bullish: bool):
+    """Path-dependent MC: barrier placed on the side opposite the trend
+    (bullish trend -> barrier below current price; bearish -> above),
+    mirroring the original bot's directional bias. Grid-searches
+    (duration, sigma) for the combo whose simulated P(no_touch) is
+    closest to MC_TARGET_PROB, for each candidate duration."""
+    returns = sc.returns()
+    vol = _tick_vol(returns)
+    if vol is None:
         return []
+    mean_dt = _mean_tick_dt(sc)
+    price = sc.prices()[-1]
 
     candidates = []
-    for s in resp.get("active_symbols", []):
-        symbol = s.get("underlying_symbol")
-        if not symbol or "1HZ" in symbol:
-            continue
-        if not symbol.startswith("R_"):
-            continue
-        if s.get("market") != "synthetic_index":
-            continue
-        if not s.get("exchange_is_open", 1):
-            continue
-        candidates.append(symbol)
-    print(f"[fetch_tradable_symbols] {len(candidates)} R_ candidates before contracts_for check")
+    for minutes in NOTOUCH_DURATIONS:
+        n_ticks = max(5, int(round(minutes * 60.0 / mean_dt)))
+        cum_log, running_max, running_min = _simulate_paths(vol, n_ticks)
+        best_for_duration = None
+        for sigma_k in MC_SIGMA_GRID:
+            scaled_vol = vol * np.sqrt(n_ticks)
+            log_dist = sigma_k * scaled_vol
+            if trend_is_bullish:
+                barrier_log = -log_dist
+                touched = running_min[:, -1] <= barrier_log
+                side = "below"
+            else:
+                barrier_log = log_dist
+                touched = running_max[:, -1] >= barrier_log
+                side = "above"
+            p_no_touch = float(np.mean(~touched))
+            diff = abs(p_no_touch - MC_TARGET_PROB)
+            if best_for_duration is None or diff < best_for_duration["diff"]:
+                best_for_duration = {
+                    "duration": minutes, "duration_unit": "m", "side": side,
+                    "barrier_price": round(float(price * np.exp(barrier_log)), 4),
+                    "p_no_touch": round(p_no_touch, 4), "diff": diff,
+                }
+        if best_for_duration is not None:
+            candidates.append(best_for_duration)
 
-    verified = []
-    cf_errors = []
-    for symbol in candidates:
-        try:
-            cf = await client.send({"contracts_for": symbol})
-            if "error" in cf:
-                cf_errors.append(f"{symbol}: {cf['error']}")
-                continue
-            types = {c["contract_type"] for c in cf.get("contracts_for", {}).get("available", [])}
-            if "CALL" in types and "PUT" in types:
-                verified.append(symbol)
-        except Exception as e:
-            cf_errors.append(f"{symbol}: {type(e).__name__}: {e}")
-        await asyncio.sleep(0.05)
-
-    if cf_errors:
-        print(f"[fetch_tradable_symbols] {len(cf_errors)} contracts_for calls failed, e.g.: {cf_errors[:3]}")
-    print(f"[fetch_tradable_symbols] verified R_ symbols: {verified}")
-    return verified
+    candidates.sort(key=lambda c: c["diff"])
+    return candidates[:CANDIDATE_TOP_K]
 
 
-async def select_top_1hz(client, n_top=3):
-    """Fetches all 1HZ synthetic-index symbols that support CALL/PUT, bootstraps
-    a short tick history for each, then ranks by tick-flow consistency (lowest
-    coefficient-of-variation of inter-tick gaps = most active / most liquid).
-    Returns the top n_top as a list of symbol names.
-
-    Why consistency rather than just speed: all 1HZ symbols nominally tick every
-    second, but some have gaps and bursts (irregular flow) while others tick very
-    evenly. Even gap distribution means more reliable statistical model fitting
-    and more predictable execution timing."""
-    resp = await client.send({"active_symbols": "brief"})
-    if "error" in resp:
-        print(f"[select_top_1hz] active_symbols error: {resp['error']}")
+def mc_select_expiryrange(sc: SymbolCandles):
+    """Terminal-value-only MC (ends-in-range doesn't care what the path
+    touched along the way, only where it finishes): for each candidate
+    duration, picks the symmetric barrier width whose simulated
+    P(ends inside range) is closest to MC_TARGET_PROB."""
+    returns = sc.returns()
+    vol = _tick_vol(returns)
+    if vol is None:
         return []
+    mean_dt = _mean_tick_dt(sc)
+    price = sc.prices()[-1]
 
     candidates = []
-    for s in resp.get("active_symbols", []):
-        symbol = s.get("underlying_symbol")
-        if not symbol or "1HZ" not in symbol:
-            continue
-        if s.get("market") != "synthetic_index":
-            continue
-        if not s.get("exchange_is_open", 1):
-            continue
-        candidates.append(symbol)
+    for minutes in EXPIRYRANGE_DURATIONS:
+        n_ticks = max(5, int(round(minutes * 60.0 / mean_dt)))
+        scaled_vol = vol * np.sqrt(n_ticks)
+        # Simulate only the terminal value - much cheaper than full paths.
+        terminal = np.random.normal(0.0, scaled_vol, size=MC_SIMULATIONS)
+        best_for_duration = None
+        for sigma_k in MC_SIGMA_GRID:
+            log_dist = sigma_k * scaled_vol
+            inside = np.abs(terminal) <= log_dist
+            p_in = float(np.mean(inside))
+            diff = abs(p_in - MC_TARGET_PROB)
+            if best_for_duration is None or diff < best_for_duration["diff"]:
+                best_for_duration = {
+                    "duration": minutes, "duration_unit": "m",
+                    "barrier_high": round(float(price * np.exp(log_dist)), 4),
+                    "barrier_low": round(float(price * np.exp(-log_dist)), 4),
+                    "p_in_range": round(p_in, 4), "diff": diff,
+                }
+        if best_for_duration is not None:
+            candidates.append(best_for_duration)
 
-    print(f"[select_top_1hz] {len(candidates)} 1HZ candidates found: {candidates}")
-
-    # verify CALL/PUT support
-    verified = []
-    for symbol in candidates:
-        try:
-            cf = await client.send({"contracts_for": symbol})
-            if "error" in cf:
-                continue
-            types = {c["contract_type"] for c in cf.get("contracts_for", {}).get("available", [])}
-            if "CALL" in types and "PUT" in types:
-                verified.append(symbol)
-        except Exception:
-            continue
-        await asyncio.sleep(0.05)
-
-    print(f"[select_top_1hz] {len(verified)} CALL/PUT-eligible 1HZ symbols: {verified}")
-
-    if not verified:
-        return []
-
-    # bootstrap a short history for each candidate and measure tick consistency
-    scores = {}
-    for symbol in verified:
-        try:
-            resp2 = await client.send({
-                "ticks_history": symbol, "count": 200, "end": "latest", "style": "ticks"
-            })
-            times = resp2.get("history", {}).get("times", [])
-            if len(times) < 10:
-                continue
-            gaps = [times[i+1] - times[i] for i in range(len(times)-1)]
-            mean_gap = sum(gaps) / len(gaps)
-            std_gap = (sum((g - mean_gap)**2 for g in gaps) / len(gaps)) ** 0.5
-            cv = std_gap / mean_gap if mean_gap > 0 else 999
-            scores[symbol] = cv
-            print(f"[select_top_1hz] {symbol}: mean_gap={mean_gap:.2f}s  cv={cv:.3f}")
-        except Exception as e:
-            print(f"[select_top_1hz] {symbol}: bootstrap failed: {e}")
-        await asyncio.sleep(0.05)
-
-    if not scores:
-        print("[select_top_1hz] no consistency data collected, returning all verified (up to n_top)")
-        return verified[:n_top]
-
-    ranked = sorted(scores, key=scores.get)          # ascending CV = most consistent first
-    top = ranked[:n_top]
-    print(f"[select_top_1hz] top {n_top} by tick consistency: {top}")
-    return top
+    candidates.sort(key=lambda c: c["diff"])
+    return candidates[:CANDIDATE_TOP_K]
 
 
-
-async def fetch_history(client, symbol, count=HISTORY_BOOTSTRAP_COUNT):
-    """Fetch up to `count` ticks by paging backwards in time.
-    Deriv's ticks_history API hard-caps each response at 1000 ticks regardless
-    of the count parameter — confirmed in live logs (always returns 1000).
-    We work around this by making ceil(count/1000) sequential calls, each time
-    using the earliest timestamp from the previous batch as the new `end` value
-    so the next call fetches the 1000 ticks immediately before that point."""
-    BATCH = 1000
-    all_ticks = []
-    end = "latest"
-
-    while len(all_ticks) < count:
-        resp = await client.send({
-            "ticks_history": symbol,
-            "count": BATCH,
-            "end": end,
-            "style": "ticks",
-        })
-        history = resp.get("history", {})
-        times  = history.get("times",  [])
-        prices = history.get("prices", [])
-        if not times:
-            break   # no more history available
-
-        batch = list(zip(times, prices))
-        # Prepend so earlier ticks come first in final list
-        all_ticks = batch + all_ticks
-
-        if len(batch) < BATCH:
-            break   # API returned fewer than requested — we've hit the start of available history
-
-        # Next call: fetch ticks ending just before the earliest tick in this batch
-        earliest_epoch = int(times[0]) - 1
-        end = earliest_epoch
-
-    # Trim to requested count (most recent ticks)
-    if len(all_ticks) > count:
-        all_ticks = all_ticks[-count:]
-
-    return all_ticks
+def _mean_tick_dt(sc: SymbolCandles):
+    if len(sc.ticks) < 2:
+        return 2.0
+    epochs = [e for e, _ in sc.ticks]
+    gaps = np.diff(epochs[-200:]) if len(epochs) >= 200 else np.diff(epochs)
+    gaps = gaps[gaps > 0]
+    return float(np.mean(gaps)) if len(gaps) else 2.0
 
 
-async def buy_contract(client, symbol, direction, duration, duration_unit, stake):
-    contract_type = "CALL" if direction > 0 else "PUT"
+# ---------------------------------------------------------------------------
+# LIVE QUOTING + EXECUTION
+# ---------------------------------------------------------------------------
+async def quote_notouch(client, symbol, barrier_price, duration, duration_unit, stake):
     req = {
-        "buy": "1",
-        "price": stake,
-        "parameters": {
-            "amount": stake,
-            "basis": "stake",
-            "contract_type": contract_type,
-            "currency": "USD",
-            "duration": int(duration),   # Deriv requires integer; guard against numpy int / float
-            "duration_unit": duration_unit,
-            "underlying_symbol": symbol,
-        },
+        "proposal": 1, "amount": round(float(stake), 2), "basis": "stake",
+        "contract_type": "NOTOUCH", "currency": "USD",
+        "duration": int(duration), "duration_unit": duration_unit,
+        "symbol": symbol, "barrier": f"{barrier_price:.4f}",
     }
     resp = await client.send(req)
+    if "error" in resp:
+        return None
+    p = resp["proposal"]
+    return {"payout": round(float(p["payout"]), 2),
+            "ask_price": round(float(p["ask_price"]), 2),
+            "proposal_id": p["id"]}
+
+
+async def quote_expiryrange(client, symbol, barrier_high, barrier_low, duration, duration_unit, stake):
+    req = {
+        "proposal": 1, "amount": round(float(stake), 2), "basis": "stake",
+        "contract_type": "EXPIRYRANGE", "currency": "USD",
+        "duration": int(duration), "duration_unit": duration_unit,
+        "symbol": symbol,
+        "barrier": f"{barrier_high:.4f}",
+        "barrier2": f"{barrier_low:.4f}",
+    }
+    resp = await client.send(req)
+    if "error" in resp:
+        return None
+    p = resp["proposal"]
+    return {"payout": round(float(p["payout"]), 2),
+            "ask_price": round(float(p["ask_price"]), 2),
+            "proposal_id": p["id"]}
+
+
+async def select_best_notouch(client, symbol, sc, trend_is_bullish, stake):
+    grid = mc_select_notouch(sc, trend_is_bullish)
+    best = None
+    for cand in grid:
+        if cand["duration"] < NOTOUCH_MIN_MINUTES:
+            continue
+        q = await quote_notouch(client, symbol, cand["barrier_price"],
+                                 cand["duration"], cand["duration_unit"], stake)
+        if q is None:
+            continue
+        payout_ratio = q["payout"] / q["ask_price"] if q["ask_price"] > 0 else 0.0
+        ev = cand["p_no_touch"] * payout_ratio - 1.0
+        if best is None or ev > best["ev"]:
+            best = {**cand, **q, "payout_ratio": round(payout_ratio, 3), "ev": round(ev, 3)}
+    return best
+
+
+async def select_best_expiryrange(client, symbol, sc, stake):
+    grid = mc_select_expiryrange(sc)
+    best = None
+    for cand in grid:
+        if cand["duration"] < EXPIRYRANGE_MIN_MINUTES:
+            continue
+        q = await quote_expiryrange(client, symbol, cand["barrier_high"], cand["barrier_low"],
+                                     cand["duration"], cand["duration_unit"], stake)
+        if q is None:
+            continue
+        payout_ratio = q["payout"] / q["ask_price"] if q["ask_price"] > 0 else 0.0
+        ev = cand["p_in_range"] * payout_ratio - 1.0
+        if best is None or ev > best["ev"]:
+            best = {**cand, **q, "payout_ratio": round(payout_ratio, 3), "ev": round(ev, 3)}
+    return best
+
+
+async def buy_from_proposal(client, proposal_id, stake):
+    resp = await client.send({"buy": proposal_id, "price": round(float(stake), 2)})
     if "error" in resp:
         raise RuntimeError(resp["error"].get("message", "buy failed"))
     return resp["buy"]["contract_id"]
@@ -1110,3700 +653,143 @@ async def wait_for_contract_result(client, contract_id):
 
 
 # ---------------------------------------------------------------------------
-# LAYER 1: MARKOV CHAIN (order-2, Laplace/Dirichlet smoothed)
+# MONEY MANAGEMENT (ported from the original bot's variables)
 # ---------------------------------------------------------------------------
-def markov_directional_prob(returns, order=2, alpha_smooth=1.0):
-    signs = np.sign(returns)
-    signs = signs[signs != 0]
-    if len(signs) < order + 20:
-        return 0.5
-    table = defaultdict(lambda: [alpha_smooth, alpha_smooth])  # [down_count, up_count]
-    for i in range(len(signs) - order):
-        state = tuple(signs[i:i + order])
-        idx = 1 if signs[i + order] > 0 else 0
-        table[state][idx] += 1
-    current_state = tuple(signs[-order:])
-    down_c, up_c = table[current_state]
-    return float(up_c / (up_c + down_c))
-
-
-# ---------------------------------------------------------------------------
-# LAYER 2: HIDDEN MARKOV MODEL (real Baum-Welch fit via hmmlearn)
-# ---------------------------------------------------------------------------
-def fit_hmm(returns, n_states=2):
-    """
-    FIX v3: Default changed from n_states=3 to n_states=2.
-
-    Live log analysis confirmed 'falling back to 2-state model' appeared for
-    EVERY symbol on EVERY calibration cycle without exception. The 3-state
-    attempt was burning through 4 random seeds (all failing the degeneracy
-    check) before falling back to 4 more 2-state seeds — wasting ~50% of
-    HMM fitting compute on a path that was universally rejected. Tick-level
-    synthetic index returns only support 2 genuine regimes (calm/excited),
-    so 2-state is the correct model complexity. Defaulting to it directly
-    eliminates the wasted 3-state seed attempts and gives the 2-state model
-    a cleaner, faster fit on every calibration cycle.
-    The multi-seed and degeneracy-check logic is kept in case a caller
-    explicitly requests n_states=3 in future, but normal operation no longer
-    hits it.
-    """
-    if len(returns) < MIN_TICKS_FOR_FIT:
-        return None
-
-    X = returns.reshape(-1, 1)
-
-    def _try_fit(k, seeds=(42, 7, 123, 2024)):
-        best_model, best_score = None, -np.inf
-        for seed in seeds:
-            try:
-                m = GaussianHMM(n_components=k, covariance_type="diag",
-                                n_iter=100, random_state=seed,
-                                min_covar=1e-4)
-                m.fit(X)
-                score = m.score(X)
-                stat_dist = m.get_stationary_distribution()
-                is_degenerate = bool(np.min(stat_dist) < 0.05)
-                if not is_degenerate and score > best_score:
-                    best_model, best_score = m, score
-            except Exception:
-                continue
-        return best_model
-
-    # Direct 2-state fit — no wasted 3-state attempts
-    model = _try_fit(n_states)
-    if model is not None:
-        return model
-
-    # Fallback: try higher state count if explicitly requested and 2-state failed
-    if n_states > 2:
-        vlog(f"[HMM] {n_states}-state fit degenerate on all seeds — "
-              f"falling back to 2-state model.")
-        model = _try_fit(2)
-        if model is not None:
-            return model
-
-    # Last resort: accept borderline fit rather than no HMM signal at all
-    try:
-        m = GaussianHMM(n_components=2, covariance_type="diag",
-                        n_iter=100, random_state=42, min_covar=1e-4)
-        m.fit(X)
-        return m
-    except Exception as e:
-        print(f"[HMM] fit failed entirely: {e}")
-        return None
-
-
-def hmm_trend_weight(model, recent_returns):
-    """
-    Returns (trend_weight, directional_lean).
-
-    FIX v2: The original computed lean = sum(posterior * HMM_means) and then
-    applied tanh(lean * 200). For synthetic index log-returns, HMM state means
-    are O(1e-4), so lean ≈ 1e-4 and tanh(1e-4 * 200) ≈ 0.02 — the lean
-    signal was effectively zero on every tick (confirmed: HMM max value was
-    0.0018 across all 90 live trades).
-
-    Fix: normalise the raw lean by the actual standard deviation of recent
-    returns BEFORE applying tanh. This makes the signal dimensionless and
-    proportional to genuine directional persistence in return units, so it
-    reaches ±1 when the regime state genuinely favours a direction.
-
-    momentum_mode now also requires BOTH trend_weight > 0.60 AND h > 0.55
-    (h > 0.52 was too easy to trigger given measurement noise around 0.5).
-    """
-    if model is None or len(recent_returns) < 5:
-        return 0.5, 0.0
-    try:
-        X = recent_returns.reshape(-1, 1)
-        posteriors  = model.predict_proba(X)
-        current     = posteriors[-1]
-        means       = model.means_.flatten()
-        variances   = np.array([np.sqrt(c[0][0]) for c in model.covars_])
-
-        # Raw lean in return units (O(1e-4) for synthetic indices)
-        lean_raw    = float(np.sum(current * means))
-
-        # Normalise: express lean in units of recent-return std
-        return_std  = float(np.std(recent_returns)) + 1e-8
-        lean_norm   = lean_raw / return_std          # dimensionless, O(1)
-
-        # tanh maps to [-1, +1] with natural saturation at 3× std
-        lean_signal = float(np.tanh(lean_norm * 3))
-
-        dominant    = int(np.argmax(current))
-        vol_rank    = variances[dominant] / (np.max(variances) + 1e-9)
-        trend_weight = float(np.clip(1.0 - vol_rank, 0.2, 0.85))
-        return trend_weight, lean_signal
-    except Exception:
-        return 0.5, 0.0
-
-
-# ---------------------------------------------------------------------------
-# LAYER 3: HAWKES PROCESS (real exponential-kernel MLE fit via scipy)
-# ---------------------------------------------------------------------------
-def hawkes_negloglik(params, event_times, T):
-    mu, alpha, beta = params
-    if mu <= 0 or alpha < 0 or beta <= 0 or alpha >= beta:
-        return 1e10
-    ll = -mu * T
-    A = 0.0
-    last_t = 0.0
-    for i, ti in enumerate(event_times):
-        if i > 0:
-            A = math.exp(-beta * (ti - last_t)) * (1 + A)
-        lam = mu + alpha * A
-        if lam <= 0:
-            return 1e10
-        ll += math.log(lam)
-        last_t = ti
-    comp = (alpha / beta) * np.sum(1 - np.exp(-beta * (T - event_times)))
-    ll -= comp
-    return -ll
-
-
-def fit_hawkes(event_times, T):
-    if len(event_times) < 10 or T <= 0:
-        return None
-    init = [max(len(event_times) / T * 0.5, 1e-4), 0.3, 1.0]
-    try:
-        res = minimize(
-            hawkes_negloglik, init, args=(event_times, T),
-            bounds=[(1e-6, None), (0.0, None), (1e-6, None)],
-            method="L-BFGS-B",
-        )
-        if not res.success:
-            return None
-        mu, alpha, beta = res.x
-        if alpha >= beta:
-            return None
-        return {"mu": mu, "alpha": alpha, "beta": beta}
-    except Exception as e:
-        print(f"[Hawkes] fit failed: {e}")
-        return None
-
-
-def hawkes_intensity_now(params, event_times, current_t):
-    if params is None or event_times is None or len(event_times) == 0:
-        return 0.0
-    mu, alpha, beta = params["mu"], params["alpha"], params["beta"]
-    past = event_times[event_times <= current_t]
-    if len(past) == 0:
-        return mu
-    excitation = np.sum(alpha * np.exp(-beta * (current_t - past)))
-    return float(mu + excitation)
-
-
-def fit_symbol_hawkes(sd):
-    returns = sd.returns()
-    epochs = sd.epochs()
-    if len(returns) < MIN_TICKS_FOR_FIT:
-        return None, None, None, None, None
-    thresh = 0.5 * np.std(returns) if np.std(returns) > 0 else 1e-9
-    origin = epochs[0]
-    event_epochs = epochs[1:]
-    up_times = (event_epochs[returns > thresh] - origin).astype(float)
-    down_times = (event_epochs[returns < -thresh] - origin).astype(float)
-    T = float(epochs[-1] - origin)
-    hawkes_up = fit_hawkes(up_times, T) if len(up_times) >= 10 else None
-    hawkes_down = fit_hawkes(down_times, T) if len(down_times) >= 10 else None
-    return origin, hawkes_up, up_times, hawkes_down, down_times
-
-
-# ---------------------------------------------------------------------------
-# LAYER 4: ORNSTEIN-UHLENBECK (OLS / Vasicek-style calibration)
-# ---------------------------------------------------------------------------
-def fit_ou(prices, dt=1.0):
-    if len(prices) < 30:
-        return None
-    x, y = prices[:-1], prices[1:]
-    try:
-        b, a = np.polyfit(x, y, 1)
-    except Exception:
-        return None
-    b = float(np.clip(b, 1e-6, 0.999999))
-    theta = -math.log(b) / dt
-    mu = a / (1 - b)
-    resid = y - (a + b * x)
-    resid_var = np.var(resid)
-    denom = 1 - b ** 2
-    sigma = math.sqrt(resid_var * 2 * theta / denom) if denom > 1e-9 else math.sqrt(max(resid_var, 1e-12))
-    return {"theta": theta, "mu": mu, "sigma": sigma}
-
-
-def ou_reversion_signal(prices, ou_params):
-    if ou_params is None or len(prices) < 2:
-        return {"z": 0.0, "reversion_dir": 0.0, "strength": 0.0}
-    mu, sigma = ou_params["mu"], (ou_params["sigma"] if ou_params["sigma"] > 0 else 1e-9)
-    z = (prices[-1] - mu) / sigma
-    theta_norm = float(np.clip(ou_params["theta"], 0, 5) / 5)
-    strength = float(np.clip(abs(z) / 2 * theta_norm, 0, 1))
-    return {"z": float(z), "reversion_dir": float(-np.sign(z)), "strength": strength}
-
-
-# ---------------------------------------------------------------------------
-# LAYER 5: HURST EXPONENT (real rescaled-range / R-S analysis)
-# ---------------------------------------------------------------------------
-def hurst_rs(prices, min_window=10):
-    """
-    FIX v2: Compute Hurst on LOG-RETURNS, not on prices.
-
-    The original used absolute prices. Prices on a random walk exhibit
-    a spurious long-range trend (they never revert to a fixed mean) so
-    R/S analysis on prices always converges to H≈1.0 regardless of the
-    true underlying dynamics. This produced hurst_signal=+1.0 on every
-    single tick, forcing momentum_mode=True permanently and injecting a
-    structural CALL bias into every Bayesian fusion that no other layer
-    could overcome.
-
-    Log-returns are stationary, zero-mean, and bounded — R/S on returns
-    gives a meaningful Hurst estimate in [0.3, 0.7] for synthetic indices.
-    """
-    prices = np.asarray(prices, dtype=float)
-    if len(prices) < 102:
-        return 0.5
-    # Convert to log-returns — stationary series with meaningful Hurst
-    series = np.diff(np.log(np.maximum(prices, 1e-10)))
-    n = len(series)
-    if n < 50:
-        return 0.5
-    max_window = n // 2
-    window_sizes = np.unique(
-        np.logspace(np.log10(min_window), np.log10(max_window), num=20).astype(int)
-    )
-    rs_points = []
-    for w in window_sizes:
-        n_chunks = n // w
-        if n_chunks < 1:
-            continue
-        rs_chunk = []
-        for i in range(n_chunks):
-            chunk = series[i * w:(i + 1) * w]
-            mean  = np.mean(chunk)
-            dev   = np.cumsum(chunk - mean)
-            R     = np.max(dev) - np.min(dev)
-            S     = np.std(chunk)
-            if S > 0:
-                rs_chunk.append(R / S)
-        if rs_chunk:
-            rs_points.append((w, np.mean(rs_chunk)))
-    if len(rs_points) < 3:
-        return 0.5
-    log_w  = np.log([w for w, _ in rs_points])
-    log_rs = np.log([rs for _, rs in rs_points])
-    slope, _ = np.polyfit(log_w, log_rs, 1)
-    return float(np.clip(slope, 0.0, 1.0))
-
-
-# ---------------------------------------------------------------------------
-# LAYER 6: ARFIMA-STYLE LONG MEMORY (fractional differencing + AR(1))
-# ---------------------------------------------------------------------------
-def fractional_diff_weights(d, size):
-    w = [1.0]
-    for k in range(1, size):
-        w.append(-w[-1] * (d - k + 1) / k)
-    return np.array(w[::-1])
-
-
-def arfima_bias(returns, hurst, lookback=150):
-    if len(returns) < 60:
-        return 0.0
-    d = float(np.clip(hurst - 0.5, -0.49, 0.49))
-    recent = returns[-lookback:]
-    n = len(recent)
-    w = fractional_diff_weights(d, n)
-    diff_series = np.convolve(recent, w, mode="valid")
-    if len(diff_series) < 15:
-        return float(np.tanh(diff_series[-1] * 50)) if len(diff_series) else 0.0
-    try:
-        ar_model = AutoReg(diff_series, lags=1, old_names=False).fit()
-        forecast = ar_model.predict(start=len(diff_series), end=len(diff_series)).iloc[0]
-    except Exception:
-        forecast = diff_series[-1]
-    return float(np.tanh(forecast * 50))
-
-
-# ---------------------------------------------------------------------------
-# LAYER 7: GARCH(1,1) (real MLE fit via the `arch` package)
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# CONFIRMATION LAYERS (L13-L18) — no model fitting needed, evaluate live
-# ---------------------------------------------------------------------------
-def compute_rsi(prices, period=14, momentum_mode=False):
-    """L13a: RSI. Regime-aware polarity.
-    momentum_mode=False (ranging)  — mean-reversion: RSI<30 → +signal, RSI>70 → -signal
-    momentum_mode=True  (trending) — momentum: RSI>55 → +signal, RSI<45 → -signal"""
-    if len(prices) < period + 2:
-        return 50.0, 0.0
-    deltas   = np.diff(prices[-(period + 2):])
-    gains    = np.where(deltas > 0, deltas, 0.0)
-    losses   = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = np.mean(gains[-period:])
-    avg_loss = np.mean(losses[-period:])
-    if avg_loss == 0:
-        rsi = 100.0
-    else:
-        rs  = avg_gain / avg_loss
-        rsi = 100.0 - (100.0 / (1 + rs))
-    if momentum_mode:
-        if rsi > 55:   signal = (rsi - 55) / 45
-        elif rsi < 45: signal = -(45 - rsi) / 45
-        else:          signal = 0.0
-    else:
-        if rsi < 30:   signal = (30 - rsi) / 30
-        elif rsi > 70: signal = -(rsi - 70) / 30
-        else:          signal = 0.0
-    return float(rsi), float(np.clip(signal, -1, 1))
-
-
-def compute_stoch_rsi(prices, rsi_period=14, stoch_period=14, momentum_mode=False):
-    """L13b: Stochastic RSI. Regime-aware polarity.
-    momentum_mode=False → mean-reversion: stoch<0.2 = +signal, stoch>0.8 = -signal
-    momentum_mode=True  → momentum:       stoch>0.6 = +signal, stoch<0.4 = -signal"""
-    if len(prices) < rsi_period + stoch_period + 5:
-        return 0.5, 0.0
-    rsi_series = []
-    for i in range(stoch_period):
-        rsi_val, _ = compute_rsi(prices[:len(prices) - (stoch_period - i - 1)],
-                                  rsi_period, momentum_mode=False)
-        rsi_series.append(rsi_val)
-    rsi_series = np.array(rsi_series)
-    lo, hi = np.min(rsi_series), np.max(rsi_series)
-    if hi == lo:
-        return 0.5, 0.0
-    stoch_k = (rsi_series[-1] - lo) / (hi - lo)
-    if momentum_mode:
-        if stoch_k > 0.6:   signal = (stoch_k - 0.6) / 0.4
-        elif stoch_k < 0.4: signal = -(0.4 - stoch_k) / 0.4
-        else:                signal = 0.0
-    else:
-        if stoch_k < 0.2:   signal = (0.2 - stoch_k) / 0.2
-        elif stoch_k > 0.8: signal = -(stoch_k - 0.8) / 0.2
-        else:                signal = 0.0
-    return float(stoch_k), float(np.clip(signal, -1, 1))
-
-
-def compute_adx(prices, period=14, bar_size=5):
-    """L14: ADX trend-strength filter on BAR data, not raw ticks.
-
-    FIX v3: ADX was permanently 0.0000 on all 11 live trades even after the
-    v2 threshold fix (20→12). Root cause: tick-to-tick price differences on
-    Deriv synthetic indices are at floating-point noise level (O(0.0001)).
-    PDM and NDM at that resolution are also O(0.0001), making ATR≈0 and
-    producing ADX≈0 regardless of actual trend strength.
-
-    Fix: aggregate raw ticks into `bar_size`-tick bars (same approach used
-    by multi_timeframe_confluence) before computing ADX. At 5-tick bars the
-    bar-to-bar price differences are O(0.001-0.01) — large enough for ATR
-    to be non-zero and for PDM/NDM to carry directional information.
-    Requires period * bar_size * 2 raw ticks (140 ticks with defaults).
-
-    Returns (adx_value, trend_strength_0_to_1, direction_bias +1/-1/0).
-    """
-    min_ticks = period * bar_size * 2
-    if len(prices) < min_ticks:
-        return 20.0, 0.3, 0.0
-
-    # Aggregate into bar_size-tick bars using close prices
-    n_bars = len(prices) // bar_size
-    bars   = prices[:n_bars * bar_size].reshape(n_bars, bar_size)
-    # Use open (first) and close (last) of each bar for H/L approximation
-    highs  = np.max(bars, axis=1)
-    lows   = np.min(bars, axis=1)
-    closes = bars[:, -1]
-
-    if len(closes) < period * 2 + 1:
-        return 20.0, 0.3, 0.0
-
-    tr_list, pdm_list, ndm_list = [], [], []
-    for i in range(1, len(closes)):
-        # True range using prior close as reference
-        tr  = max(highs[i] - lows[i],
-                  abs(highs[i] - closes[i-1]),
-                  abs(lows[i]  - closes[i-1]))
-        pdm = max(highs[i] - highs[i-1], 0.0)
-        ndm = max(lows[i-1] - lows[i],   0.0)
-        # Directional move convention: only count if dominant direction
-        if pdm > ndm:
-            ndm = 0.0
-        elif ndm > pdm:
-            pdm = 0.0
-        tr_list.append(tr)
-        pdm_list.append(pdm)
-        ndm_list.append(ndm)
-
-    tr_a  = np.array(tr_list[-period * 2:])
-    pdm_a = np.array(pdm_list[-period * 2:])
-    ndm_a = np.array(ndm_list[-period * 2:])
-
-    # Wilder smoothing (EMA-style)
-    def _wilder(arr, p):
-        if len(arr) < p:
-            return float(np.mean(arr))
-        s = float(np.sum(arr[:p]))
-        for v in arr[p:]:
-            s = s - s / p + v
-        return s / p
-
-    atr = _wilder(tr_a, period)
-    if atr < 1e-10:
-        return 20.0, 0.3, 0.0
-
-    pdi = 100 * _wilder(pdm_a, period) / atr
-    ndi = 100 * _wilder(ndm_a, period) / atr
-    dx  = 100 * abs(pdi - ndi) / (pdi + ndi + 1e-9)
-
-    # Rolling DX for smoothed ADX
-    dx_list = []
-    for i in range(period, len(tr_a)):
-        t = _wilder(tr_a[:i+1], period)
-        if t < 1e-10:
-            continue
-        p_ = 100 * _wilder(pdm_a[:i+1], period) / t
-        n_ = 100 * _wilder(ndm_a[:i+1], period) / t
-        dx_list.append(100 * abs(p_ - n_) / (p_ + n_ + 1e-9))
-    adx = float(_wilder(np.array(dx_list), period)) if dx_list else dx
-    adx = float(np.clip(adx, 0, 100))
-
-    # Threshold tuned for bar-level data: ADX=15 → mild trend, ADX=32 → strong
-    trend_strength = float(np.clip((adx - 12) / 20, 0, 1))
-    up_bias        = float(np.sign(pdi - ndi))
-    return adx, trend_strength, up_bias
-
-
-def compute_bollinger(prices, period=20, n_std=2.0, momentum_mode=False):
-    """L15: Bollinger Band %B. Regime-aware polarity.
-    momentum_mode=False (ranging)  — mean-reversion: upper band → -signal (expect down)
-    momentum_mode=True  (trending) — momentum: upper band → +signal (trend continues up)"""
-    if len(prices) < period + 2:
-        return 0.5, 0.0
-    window = prices[-period:]
-    mid    = np.mean(window)
-    std    = np.std(window)
-    if std == 0:
-        return 0.5, 0.0
-    upper  = mid + n_std * std
-    lower  = mid - n_std * std
-    pct_b  = float(np.clip((prices[-1] - lower) / (upper - lower + 1e-9), -0.5, 1.5))
-    if momentum_mode:
-        signal = float(np.clip((pct_b - 0.5) * 2, -1, 1))   # follow: +1 at upper, -1 at lower
-    else:
-        signal = float(np.clip((0.5 - pct_b) * 2, -1, 1))   # fade:   +1 at lower, -1 at upper
-    return pct_b, signal
-
-
-def compute_zscore(prices, period=50, momentum_mode=False):
-    """L16: Z-score of price vs rolling mean. Regime-aware polarity.
-    momentum_mode=False (ranging)  — fade the move: high z → -signal (expect reversion)
-    momentum_mode=True  (trending) — follow the move: high z → +signal (trend continues)"""
-    if len(prices) < period + 2:
-        return 0.0, 0.0
-    window = prices[-period:]
-    mu     = np.mean(window)
-    sigma  = np.std(window) if np.std(window) > 0 else 1e-9
-    z      = (prices[-1] - mu) / sigma
-    if momentum_mode:
-        signal = float(np.clip(z / 2,  -1, 1))   # follow the move
-    else:
-        signal = float(np.clip(-z / 2, -1, 1))   # fade the move
-    return float(z), signal
-
-
-def transfer_entropy(source_returns, target_returns, lag=1, bins=5):
-    """L17: Transfer entropy from source to target. Measures whether source's
-    past directional moves provide information about target's next move,
-    beyond what target's own history provides. Returns positive value if
-    source -> target information flow exists, else near-zero.
-
-    Uses binned estimator for speed (proper KSG estimator is O(n^2)).
-    Returns a signed directional signal: positive = source predicts target
-    up, negative = source predicts target down."""
-    n = min(len(source_returns), len(target_returns)) - lag
-    if n < 30:
-        return 0.0
-    s = source_returns[-n - lag:-lag]
-    t_past   = target_returns[-n - lag:-lag]
-    t_future = target_returns[-n:]
-    try:
-        s_bin  = np.digitize(s,       np.percentile(s,       np.linspace(0, 100, bins + 1)[1:-1]))
-        tp_bin = np.digitize(t_past,  np.percentile(t_past,  np.linspace(0, 100, bins + 1)[1:-1]))
-        tf_bin = np.digitize(t_future,np.percentile(t_future,np.linspace(0, 100, bins + 1)[1:-1]))
-        # P(t_future | t_past, s) vs P(t_future | t_past)
-        joint3  = np.zeros((bins, bins, bins))
-        joint2  = np.zeros((bins, bins))
-        joint2b = np.zeros((bins, bins))
-        marg    = np.zeros(bins)
-        for i in range(n):
-            si  = min(s_bin[i],  bins - 1)
-            tpi = min(tp_bin[i], bins - 1)
-            tfi = min(tf_bin[i], bins - 1)
-            joint3[tfi, tpi, si]  += 1
-            joint2[tfi, tpi]      += 1
-            joint2b[tpi, si]      += 1
-            marg[tpi]             += 1
-        joint3  = joint3 / (n + 1e-9)
-        joint2  = joint2 / (n + 1e-9)
-        joint2b = joint2b / (n + 1e-9)
-        marg    = marg / (n + 1e-9)
-        te = 0.0
-        for tfi in range(bins):
-            for tpi in range(bins):
-                for si in range(bins):
-                    num = joint3[tfi, tpi, si]
-                    if num <= 0: continue
-                    denom_a = joint2b[tpi, si] if joint2b[tpi, si] > 0 else 1e-9
-                    denom_b = joint2[tfi, tpi] if joint2[tfi, tpi] > 0 else 1e-9
-                    base    = marg[tpi]         if marg[tpi] > 0         else 1e-9
-                    te += num * np.log((num * base) / (denom_a * denom_b) + 1e-9)
-        # directional component: if source recently moved up, does target follow?
-        src_dir = np.sign(np.mean(s[-5:]))
-        return float(np.clip(te * src_dir, -1, 1))
-    except Exception:
-        return 0.0
-
-
-
-
-# ---------------------------------------------------------------------------
-# LAYER 17: DIVERGENCE DETECTION (Price vs RSI — all four types)
-# ---------------------------------------------------------------------------
-def _rsi_series(prices, period=14):
-    """Rolling RSI series over the full price array."""
-    if len(prices) < period + 2:
-        return np.full(len(prices), 50.0)
-    rsi_vals = np.full(len(prices), 50.0)
-    for i in range(period + 1, len(prices)):
-        deltas = np.diff(prices[max(0, i - period - 1):i + 1])
-        gains  = np.where(deltas > 0, deltas, 0.0)
-        losses = np.where(deltas < 0, -deltas, 0.0)
-        ag = np.mean(gains[-period:])
-        al = np.mean(losses[-period:])
-        rsi_vals[i] = 100.0 - (100.0 / (1 + ag / al)) if al > 0 else 100.0
-    return rsi_vals
-
-
-def _find_pivots(series, left=5, right=5):
-    """Returns (highs, lows) as lists of (index, value) — last 3 of each."""
-    n = len(series)
-    highs, lows = [], []
-    for i in range(left, n - right):
-        window = series[i - left: i + right + 1]
-        if series[i] == np.max(window):
-            highs.append((i, float(series[i])))
-        if series[i] == np.min(window):
-            lows.append((i, float(series[i])))
-    return highs[-3:], lows[-3:]
-
-
-def compute_divergence(prices, rsi_period=14, pivot_left=5, pivot_right=5):
-    """
-    Price vs RSI divergence signal in [-1, +1].
-    +1 = bullish divergence (regular or hidden).
-    -1 = bearish divergence (regular or hidden).
-     0 = no divergence.
-    Regular divergence (exhaustion/reversal): magnitude 0.6-1.0
-    Hidden  divergence (trend continuation):  magnitude 0.4-0.7
-    """
-    min_len = rsi_period + pivot_left + pivot_right + 15
-    if len(prices) < min_len:
-        return 0.0
-
-    rsi = _rsi_series(prices, rsi_period)
-    price_highs, price_lows = _find_pivots(prices, pivot_left, pivot_right)
-    rsi_highs,   rsi_lows   = _find_pivots(rsi,    pivot_left, pivot_right)
-
-    if len(price_highs) < 2 or len(rsi_highs) < 2:
-        return 0.0
-    if len(price_lows)  < 2 or len(rsi_lows)  < 2:
-        return 0.0
-
-    ph1_i, ph1_v = price_highs[-1]
-    ph2_i, ph2_v = price_highs[-2]
-    pl1_i, pl1_v = price_lows[-1]
-    pl2_i, pl2_v = price_lows[-2]
-
-    def _nearest(pivots, target_idx, tol=8):
-        matches = [(abs(i - target_idx), v) for i, v in pivots
-                   if abs(i - target_idx) <= tol]
-        return min(matches, key=lambda x: x[0])[1] if matches else None
-
-    rh1 = _nearest(rsi_highs, ph1_i)
-    rh2 = _nearest(rsi_highs, ph2_i)
-    rl1 = _nearest(rsi_lows,  pl1_i)
-    rl2 = _nearest(rsi_lows,  pl2_i)
-
-    price_std = float(np.std(prices)) + 1e-8
-    signal = 0.0
-
-    # Bearish divergences (SHORT)
-    if rh1 is not None and rh2 is not None:
-        mag = min(1.0, abs(ph1_v - ph2_v) / price_std * 3)
-        if ph1_v > ph2_v and rh1 < rh2:   # regular bearish
-            signal = min(signal, -0.65 * (0.5 + 0.5 * mag))
-        if ph1_v < ph2_v and rh1 > rh2:   # hidden bearish
-            signal = min(signal, -0.45 * (0.5 + 0.5 * mag))
-
-    # Bullish divergences (LONG)
-    if rl1 is not None and rl2 is not None:
-        mag = min(1.0, abs(pl1_v - pl2_v) / price_std * 3)
-        if pl1_v < pl2_v and rl1 > rl2:   # regular bullish
-            signal = max(signal, +0.65 * (0.5 + 0.5 * mag))
-        if pl1_v > pl2_v and rl1 < rl2:   # hidden bullish
-            signal = max(signal, +0.45 * (0.5 + 0.5 * mag))
-
-    return float(np.clip(signal, -1.0, 1.0))
-
-
-def detect_jumps(returns, threshold_sigma=2.5):
-    """L18: Jump-diffusion — Merton-style jump detection. Identifies ticks
-    where the absolute return exceeds threshold_sigma standard deviations
-    (likely engineered jumps in synthetic indices). Returns:
-      jump_intensity  : recent jump frequency (0-1 normalised)
-      jump_direction  : +1 if recent jumps were up, -1 if down, 0 if mixed
-      post_jump_signal: after a large jump, expect partial reversion (-jump_dir)"""
-    if len(returns) < 30:
-        return 0.0, 0.0, 0.0
-    sigma = np.std(returns)
-    if sigma == 0:
-        return 0.0, 0.0, 0.0
-    z_scores  = returns / sigma
-    jump_mask = np.abs(z_scores) > threshold_sigma
-    recent    = jump_mask[-20:]
-    intensity = float(np.mean(recent))
-    if not np.any(recent):
-        return intensity, 0.0, 0.0
-    recent_z  = z_scores[-20:]
-    jump_dirs = np.sign(recent_z[recent])
-    jump_dir  = float(np.mean(jump_dirs)) if len(jump_dirs) > 0 else 0.0
-    # post-jump: last tick was a jump → expect partial reversion
-    post_jump = -float(np.sign(z_scores[-1])) if jump_mask[-1] else 0.0
-    return intensity, float(jump_dir), float(post_jump)
-
-
-def fit_garch(returns, scale=1000.0):
-    if len(returns) < MIN_TICKS_FOR_FIT:
-        return None
-    try:
-        scaled = returns * scale
-        am = arch_model(scaled, vol="Garch", p=1, q=1, mean="Zero", dist="normal")
-        # arch's SLSQP optimizer prints convergence diagnostics directly to
-        # stdout/stderr on non-convergence, bypassing warnings.filterwarnings.
-        # These aren't fatal (a result is still returned) but were showing up
-        # as noisy 'error' severity log lines - fully suppress at the source.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                result = am.fit(disp="off")
-        return result
-    except Exception as e:
-        print(f"[GARCH] fit failed: {e}")
-        return None
-
-
-def garch_vol_trust(garch_result, returns, scale=1000.0):
-    if garch_result is None:
-        return 0.5, None
-    try:
-        forecast = garch_result.forecast(horizon=1, reindex=False)
-        cond_vol = math.sqrt(float(forecast.variance.values[-1, 0])) / scale
-        baseline_vol = np.std(returns) if np.std(returns) > 0 else 1e-9
-        ratio = cond_vol / baseline_vol
-        trust = 1.0 / (1.0 + max(ratio - 1, 0) * 2)
-        return float(np.clip(trust, 0.1, 1.0)), cond_vol
-    except Exception:
-        return 0.5, None
-
-
-# ---------------------------------------------------------------------------
-# LAYER 8: SAMPLE ENTROPY (proper formula, not histogram Shannon entropy)
-# ---------------------------------------------------------------------------
-def sample_entropy_trust(returns, m=2, r_mult=0.2):
-    if len(returns) < 30:
-        return 0.5
-    r = r_mult * np.std(returns)
-    if r <= 0:
-        return 0.5
-    n = len(returns)
-
-    def _phi(mm):
-        x = np.array([returns[i:i + mm] for i in range(n - mm + 1)])
-        count, total = 0, 0
-        for i in range(len(x)):
-            dist = np.max(np.abs(x - x[i]), axis=1)
-            count += np.sum(dist <= r) - 1
-            total += len(x) - 1
-        return count / total if total > 0 else 0.0
-
-    phi_m, phi_m1 = _phi(m), _phi(m + 1)
-    if phi_m == 0 or phi_m1 == 0:
-        return 0.5
-    sampen = -math.log(phi_m1 / phi_m)
-    return float(np.clip(1.0 / (1.0 + sampen), 0.1, 1.0))
-
-
-# ---------------------------------------------------------------------------
-# FIX v2 — NEW LAYER: PERMUTATION ENTROPY GATE
-# ---------------------------------------------------------------------------
-# Distinct from sample_entropy_trust above (which only down-weights evidence).
-# This is a hard pre-trade GATE: when the tick sequence is statistically
-# indistinguishable from random ordering, no amount of layer agreement is
-# trustworthy, and the trade should be skipped entirely rather than just
-# down-weighted. Permutation entropy (Bandt-Pompe) measures the predictability
-# of ordinal patterns in a short window of recent prices.
-PE_EMBED_DIM     = 5
-PE_THRESHOLD     = 0.85   # FIX v3: raised 0.82 → 0.85 based on live log analysis.
-                           # R_50 was producing PE=0.824-0.847 on every scan,
-                           # generating 331 entropy skips — nearly double the
-                           # layer-gate skips (161). This is not genuine market
-                           # randomness; it's the threshold sitting inside R_50's
-                           # natural tick-structure PE range. Genuinely chaotic
-                           # windows sit at PE=0.90+. 0.85 keeps the gate
-                           # meaningful while allowing R_50's structured windows
-                           # through to the downstream confluence/ensemble checks.
-
-def permutation_entropy(prices, m=PE_EMBED_DIM):
-    """
-    Normalised permutation entropy in [0, 1].
-    0.0 = perfectly ordered/predictable sequence.
-    1.0 = maximally random ordinal pattern distribution.
-    """
-    prices = np.asarray(prices, dtype=float)
-    n = len(prices)
-    if n < m * 3:
-        return 1.0   # not enough data -> treat as untrustworthy (high entropy)
-
-    from math import factorial
-    counts = {}
-    for i in range(n - m + 1):
-        pattern = tuple(np.argsort(prices[i:i + m]))
-        counts[pattern] = counts.get(pattern, 0) + 1
-
-    total = sum(counts.values())
-    probs = np.array([v / total for v in counts.values()])
-    H     = -float(np.sum(probs * np.log2(probs + 1e-12)))
-    H_max = float(np.log2(factorial(m)))
-    return float(np.clip(H / H_max, 0.0, 1.0))
-
-
-def entropy_gate_passes(prices, threshold=PE_THRESHOLD):
-    """
-    Returns (passes: bool, pe_score: float).
-    Uses the most recent 150 prices (or all available if fewer).
-    """
-    window = prices[-150:] if len(prices) >= 150 else prices
-    pe = permutation_entropy(window)
-    return pe < threshold, pe
-
-
-# ---------------------------------------------------------------------------
-# FIX v2 — NEW LAYER: MULTI-TIMEFRAME CONFLUENCE
-# ---------------------------------------------------------------------------
-# Computes directional agreement across three timeframes built from the SAME
-# tick stream: raw ticks (TF1), 5-tick bars (TF5), and 20-tick bars (TF20).
-# A genuine directional edge should show up at more than one timeframe
-# simultaneously; an edge visible only on raw noisy ticks is far more likely
-# to be spurious. Returns the count of timeframes agreeing with the proposed
-# direction (0-3) plus the per-TF directions for logging/diagnostics.
-MIN_TF_AGREEMENT = 2   # require at least 2 of 3 timeframes to agree
-
-def _bar_returns(prices, bar_size):
-    """Aggregate raw prices into bar_size-tick OHLC-style closes, return log-diffs."""
-    n_bars = len(prices) // bar_size
-    if n_bars < 2:
-        return np.array([])
-    bars   = prices[:n_bars * bar_size].reshape(n_bars, bar_size)
-    closes = bars[:, -1]
-    return np.diff(np.log(np.maximum(closes, 1e-10)))
-
-
-def _tf_direction(returns_segment, lookback=10):
-    """Simple mean-of-recent-returns direction vote: +1, -1, or 0 (neutral)."""
-    if len(returns_segment) < 3:
-        return 0
-    recent = returns_segment[-lookback:]
-    m = float(np.mean(recent))
-    if abs(m) < 1e-12:
-        return 0
-    return 1 if m > 0 else -1
-
-
-def multi_timeframe_confluence(prices, proposed_direction):
-    """
-    Returns (agreement_count: int 0-3, tf_directions: dict) for logging.
-    proposed_direction: +1 (CALL) or -1 (PUT) — the direction the rest of the
-    layer stack is currently leaning toward.
-    """
-    if len(prices) < 60:
-        return 0, {"tf1": 0, "tf5": 0, "tf20": 0}
-
-    returns_tf1  = np.diff(np.log(np.maximum(prices[-100:], 1e-10)))
-    returns_tf5  = _bar_returns(prices[-250:],  5)
-    returns_tf20 = _bar_returns(prices[-600:], 20)
-
-    d1  = _tf_direction(returns_tf1,  lookback=10)
-    d5  = _tf_direction(returns_tf5,  lookback=8)
-    d20 = _tf_direction(returns_tf20, lookback=5)
-
-    agreement = sum(1 for d in (d1, d5, d20) if d != 0 and d == proposed_direction)
-    return agreement, {"tf1": d1, "tf5": d5, "tf20": d20}
-
-
-# ---------------------------------------------------------------------------
-# LAYER 9: KALMAN FILTER (real 2-state local-level + trend filter)
-# ---------------------------------------------------------------------------
-def kalman_trend_filter(prices, q_level=1e-5, q_trend=1e-6, r_obs=0.01):
-    if len(prices) < 5:
-        return 0.0
-    F = np.array([[1.0, 1.0], [0.0, 1.0]])
-    H = np.array([[1.0, 0.0]])
-    Q = np.array([[q_level, 0.0], [0.0, q_trend]])
-    R = np.array([[r_obs]])
-    x = np.array([[prices[0]], [0.0]])
-    P = np.eye(2)
-    for price in prices[1:]:
-        x = F @ x
-        P = F @ P @ F.T + Q
-        y = price - (H @ x)[0, 0]
-        S = (H @ P @ H.T + R)[0, 0]
-        K = (P @ H.T) / S
-        x = x + K * y
-        P = (np.eye(2) - K @ H) @ P
-    trend = x[1, 0]
-    denom = np.std(prices) + 1e-9
-    return float(np.clip(np.sign(trend) * min(abs(trend) / denom * 10, 1.0), -1, 1))
-
-
-# ---------------------------------------------------------------------------
-# LAYER 10: COPULA (real Gaussian copula via rank-normal transform)
-# ---------------------------------------------------------------------------
-def copula_agreement(symbol, returns_window_dict):
-    symbols = list(returns_window_dict.keys())
-    if symbol not in symbols or len(symbols) < 2:
-        return 0.5
-    min_len = min(len(v) for v in returns_window_dict.values())
-    if min_len < 30:
-        return 0.5
-    data = np.array([returns_window_dict[s][-min_len:] for s in symbols]).T
-    ranks = np.apply_along_axis(rankdata, 0, data) / (min_len + 1)
-    normal_scores = norm.ppf(np.clip(ranks, 1e-4, 1 - 1e-4))
-    corr = np.corrcoef(normal_scores.T)
-    idx = symbols.index(symbol)
-    target_sign = np.sign(normal_scores[-1, idx])
-    weighted_agree, total_weight = 0.0, 0.0
-    for j in range(len(symbols)):
-        if j == idx:
-            continue
-        rho = abs(corr[idx, j])
-        peer_sign = np.sign(normal_scores[-1, j])
-        weighted_agree += rho * (1.0 if peer_sign == target_sign else 0.0)
-        total_weight += rho
-    if total_weight == 0:
-        return 0.5
-    return float(np.clip(weighted_agree / total_weight, 0, 1))
-
-
-# ---------------------------------------------------------------------------
-# MODEL FITTING ORCHESTRATOR (runs only during calibration)
-# ---------------------------------------------------------------------------
-def fit_symbol_models(sd) -> SymbolModels:
-    models = SymbolModels()
-    returns = sd.returns()
-    prices = sd.prices()
-    if len(returns) < MIN_TICKS_FOR_FIT:
-        return models
-
-    # use the actual measured mean inter-tick gap as dt so OU theta is in
-    # real seconds regardless of whether this is a 1HZ (dt~1s) or R_ (dt~2s) symbol
-    actual_dt = sd.mean_tick_dt()
-    models.tick_dt = actual_dt
-
-    models.hmm_model = fit_hmm(returns)
-    models.garch_result = fit_garch(returns, scale=models.garch_scale)
-    models.ou_params = fit_ou(prices, dt=actual_dt)
-    origin, h_up, up_ev, h_down, down_ev = fit_symbol_hawkes(sd)
-    models.origin_epoch = origin if origin is not None else sd.epochs()[0]
-    models.hawkes_up, models.hawkes_up_events = h_up, up_ev
-    models.hawkes_down, models.hawkes_down_events = h_down, down_ev
-
-    models.fitted_at = time.time()
-    models.fitted = True
-    return models
-
-
-# ---------------------------------------------------------------------------
-# LAYER 11: BAYESIAN FUSION (log-odds evidence combination - owns final direction)
-# ---------------------------------------------------------------------------
-def compute_features(sd, models, returns_window_dict):
-    """Evaluates ALL 18 layers using the CACHED fitted models. Returns None if
-    no model has been fitted yet (symbol not tradable until first calibration)."""
-    if models is None or not models.fitted:
-        return None
-    returns = sd.returns()
-    prices  = sd.prices()
-    if len(returns) < MIN_TICKS_LIVE:
-        return None
-
-    recent_returns = returns[-50:] if len(returns) >= 50 else returns
-
-    # ── Fitted-model layers (L01-L12) ──────────────────────────────────────
-    trend_weight, hmm_lean = hmm_trend_weight(models.hmm_model, recent_returns)
-    vol_trust, cond_vol    = garch_vol_trust(models.garch_result, returns, models.garch_scale)
-    ou                     = ou_reversion_signal(prices, models.ou_params)
-
-    current_t  = float(sd.epochs()[-1] - models.origin_epoch)
-    lam_up     = hawkes_intensity_now(models.hawkes_up,   models.hawkes_up_events,   current_t)
-    lam_down   = hawkes_intensity_now(models.hawkes_down, models.hawkes_down_events, current_t)
-    hawkes_sig = (lam_up - lam_down) / (lam_up + lam_down + 1e-9)
-
-    h          = hurst_rs(prices)
-    arfima     = arfima_bias(returns, h)
-    markov_p   = markov_directional_prob(returns)
-    kalman     = kalman_trend_filter(prices)
-    ent_trust  = sample_entropy_trust(returns[-150:] if len(returns) >= 150 else returns)
-    # Copula and Transfer Entropy removed (see rationale in comments below).
-    # Stub values preserve downstream key references without breaking anything.
-    #
-    # Copula: modelled joint dependence between price returns and vol changes.
-    # On algorithmically-generated synthetic indices the relationship between
-    # them is fixed by the Deriv parameter set — there is no genuine tail
-    # co-dependence to discover. The layer was contributing ~0 information
-    # beyond what vol_trust and cond_vol already capture, at meaningful
-    # compute cost (rank normalisation + correlation matrix every tick).
-    #
-    # Transfer Entropy: measures information flow from other symbols toward
-    # this one. On independent algorithmically-generated synthetics there is
-    # no genuine cross-symbol information channel — TE was measuring noise
-    # autocorrelation by another name. Hurst and ARFIMA already capture the
-    # same autocorrelation structure more cleanly on a single series.
-    copula    = 0.5   # neutral stub — no longer computed
-    te_signal = 0.0   # neutral stub — no longer computed
-
-    # Regime classification: combine HMM trend_weight + Hurst exponent.
-    # Both must agree that the market is trending before momentum mode activates.
-    #   momentum_mode=True  → RSI/StochRSI/Boll/Z-score FOLLOW the direction
-    #   momentum_mode=False → classic mean-reversion: fade overbought/oversold
-    # FIX v2: Raise h threshold from 0.52 to 0.58.
-    # True random walks (Deriv synthetics) have H≈0.50±0.05 on returns. The
-    # original 0.52 threshold was inside the noise band, meaning any slight
-    # upward bias in the H estimate triggered full momentum mode — permanently,
-    # because the old hurst_rs on prices gave H=1.0 always. After fixing
-    # hurst_rs to use returns, H will now fluctuate 0.43–0.57 on genuine
-    # random-walk synthetics. Only clearly trending regimes (H > 0.58) should
-    # activate momentum mode.
-    momentum_mode = bool(trend_weight > 0.60 and h > 0.58)
-
-    _,    rsi_signal   = compute_rsi(prices, momentum_mode=momentum_mode)
-    _,    srsi_signal  = compute_stoch_rsi(prices, momentum_mode=momentum_mode)
-    adx_val, adx_trend, adx_dir = compute_adx(prices)
-    _,    boll_signal  = compute_bollinger(prices, momentum_mode=momentum_mode)
-    z_val, z_signal    = compute_zscore(prices, momentum_mode=momentum_mode)
-
-    # v3b: Divergence detection — price vs RSI, all four types
-    # Uses the last 100 prices for efficiency (covers ~2-3 complete swing cycles)
-    div_signal = compute_divergence(
-        prices[-100:] if len(prices) >= 100 else prices
-    )
-
-    jump_intensity, jump_dir, post_jump = detect_jumps(returns)
-
-    # Hurst-derived arbiter: how much to trust momentum vs reversion layers
-    # H > 0.5 → persistent (trust momentum), H < 0.5 → anti-persistent (trust reversion)
-    # Expressed as a centred signal so it contributes its own log-odds term
-    hurst_signal = float(np.clip((h - 0.5) * 4, -1, 1))   # +1 at H=0.75, -1 at H=0.25
-
-    # ── Layer agreement pre-computation ──────────────────────────────────
-    # Compute agree/disagree counts here (not just in explain_signal) so the
-    # main loop can enforce the MIN_LAYER_AGREE / MAX_LAYER_DISAGREE gates
-    # before committing to a trade. direction is unknown at this point, so we
-    # compute counts for both sides and let the caller choose the right set.
-    # Regime strength signal — how confidently HMM + Hurst agree on current regime.
-    # Strong trending regime (high trend_weight, high h) → positive signal in
-    # direction of detected drift. Strong mean-reverting regime → counter-signal.
-    # Replaces the removed Copula slot.
-    regime_strength = float(np.tanh((trend_weight - 0.5) * 4 * (h - 0.5) * 4))
-
-    # Volatility regime signal — normalised conditional vol vs recent average.
-    # Low vol relative to recent history → cleaner directional signal.
-    # High vol spike → noisy, down-weights directional conviction.
-    # Replaces the removed Transfer Entropy slot.
-    recent_vol_avg = float(np.mean(np.abs(returns[-50:]))) + 1e-9
-    vol_regime     = float(np.tanh(-(cond_vol / recent_vol_avg - 1.0) * 3))
-
-    _layer_votes = [
-        (markov_p - 0.5) * 2,           # Markov
-        hmm_lean,                         # HMM
-        hawkes_sig,                       # Hawkes
-        ou["reversion_dir"] * ou["strength"],  # OU
-        hurst_signal,                     # Hurst
-        arfima,                           # ARFIMA
-        kalman,                           # Kalman
-        regime_strength,                  # Regime strength
-        rsi_signal,                       # RSI
-        srsi_signal,                      # StochRSI
-        adx_dir * adx_trend,             # ADX
-        boll_signal,                      # Bollinger
-        z_signal,                         # Z-score
-        vol_regime,                       # Vol regime
-        jump_dir * jump_intensity,        # Jump direction
-        post_jump * jump_intensity,       # Post-jump reversion
-        div_signal,                       # Divergence (v3b — NEW)
-    ]
-    # agree_up / disagree_up: counts from the perspective of a CALL trade
-    _agree_up    = sum(1 for v in _layer_votes if v > 0)
-    _disagree_up = sum(1 for v in _layer_votes if v < 0)
-    _neutral     = len(_layer_votes) - _agree_up - _disagree_up
-
-    return {
-        # fitted-model layers
-        "markov_p":     markov_p,
-        "hmm_lean":     hmm_lean,
-        "trend_weight": trend_weight,
-        "hawkes":       hawkes_sig,
-        "ou_dir":       ou["reversion_dir"],
-        "ou_strength":  ou["strength"],
-        "hurst":        h,
-        "hurst_signal": hurst_signal,
-        "arfima_bias":  arfima,
-        "vol_trust":    vol_trust,
-        "entropy_trust":ent_trust,
-        "kalman":       kalman,
-        "regime_strength": regime_strength,   # replaces copula_agree
-        "vol_regime":   vol_regime,            # replaces te_signal
-        "cond_vol":     cond_vol,
-        "ou_params":    models.ou_params,
-        # confirmation layers
-        "rsi_signal":    rsi_signal,
-        "srsi_signal":   srsi_signal,
-        "adx_val":       adx_val,
-        "adx_trend":     adx_trend,
-        "adx_dir":       adx_dir,
-        "boll_signal":   boll_signal,
-        "z_signal":      z_signal,
-        "z_val":         z_val,
-        "vol_regime":    vol_regime,
-        "div_signal":    div_signal,    # divergence layer (v3b)
-        "momentum_mode": momentum_mode,   # logged to trade journal for analysis
-        "jump_intensity": jump_intensity,
-        "jump_dir":     jump_dir,
-        "post_jump":    post_jump,
-        # pass through for calibration weight lookup
-        "per_layer_weights": models.per_layer_weights,
-        # layer vote counts (direction-agnostic: agree_up = votes for CALL)
-        "agree_up":    _agree_up,
-        "disagree_up": _disagree_up,
-        "n_neutral":   _neutral,
-        "n_layers":    len(_layer_votes),
-    }
-
-
-
-# =============================================================================
-# v3 UPGRADE 1 — DRIFT DETECTION (KS + PSI + CUSUM)
-# =============================================================================
-class DriftDetector:
-    """
-    Three independent drift detectors running on every symbol's live stream.
-
-    KS-test:  Compares the distribution of the last 200 live log-returns
-              against the training window snapshot. A significant shift
-              (p < KS_P_THRESHOLD) means the data-generating process has
-              changed and the fitted GARCH/HMM/OU parameters are stale.
-
-    PSI:      Population Stability Index on confidence scores. Measures
-              whether the model's output distribution has shifted vs. its
-              calibration-time distribution. PSI > 0.20 = major shift.
-              PSI = Σ (actual% - expected%) × ln(actual%/expected%)
-
-    CUSUM:    Cumulative sum of (0.5 - win_indicator) detects sustained
-              below-50% win rate sequences faster than a rolling average.
-              Resets to 0 after recalibration. Threshold = 4.0 (roughly
-              equivalent to 8-10 consecutive losses from a 50% baseline).
-
-    Any single detector firing sets drift_degraded[symbol] = True, which:
-      1. Reduces that symbol's stake to 50% of normal immediately
-      2. Triggers a recalibration request within the next main-loop cycle
-      3. Clears when the recalibration completes and detectors reset
-    """
-
-    @staticmethod
-    def check_ks(state: "TradeState", symbol: str,
-                 live_returns: np.ndarray) -> bool:
-        ref = state.drift_reference_returns.get(symbol)
-        if ref is None or len(ref) < 50 or len(live_returns) < 50:
-            return False
-        live_r = live_returns[-200:] if len(live_returns) > 200 else live_returns
-        _, pval = ks_2samp(ref, live_r)
-
-        # FIX v3: Raise KS threshold 0.05 → 0.02.
-        # Live logs showed KS firing at p=0.04 on R_50 repeatedly with the
-        # same p-value on every scan — a sign that the reference window and
-        # live window have the same slight structural difference on every tick
-        # (microstructure noise, not a real regime shift). At p < 0.05 the
-        # false positive rate is too high for a 500-tick window. At p < 0.02
-        # we require stronger evidence before declaring drift.
-        # Also added: if the same symbol fires with the same p-value more than
-        # 3 times in a row, treat as a stale reference window and skip —
-        # a genuine drift would produce varying p-values as more live ticks arrive.
-        fired = pval < KS_P_THRESHOLD
-        if fired:
-            last_p = getattr(state, f'_ks_last_p_{symbol}', None)
-            repeat  = getattr(state, f'_ks_repeat_{symbol}', 0)
-            if last_p is not None and abs(pval - last_p) < 1e-6:
-                repeat += 1
-                setattr(state, f'_ks_repeat_{symbol}', repeat)
-                if repeat >= 3:
-                    # Same p-value 3+ times = stale reference, not real drift
-                    return False
-            else:
-                setattr(state, f'_ks_repeat_{symbol}', 0)
-            setattr(state, f'_ks_last_p_{symbol}', pval)
-            vlog(f"[Drift/KS] {symbol}: p={pval:.4f} < {KS_P_THRESHOLD} "
-                  f"— return distribution shifted")
+@dataclass
+class MoneyState:
+    stake: float = FIRST_STAKE
+    total_profit: float = 0.0
+    win_count: int = 0
+    loss_count: int = 0
+    martingale_step: int = 0
+
+    def on_win(self, profit):
+        self.total_profit += profit
+        self.win_count += 1
+        self.stake = FIRST_STAKE
+        self.martingale_step = 0
+
+    def on_loss(self, profit):
+        self.total_profit += profit  # profit is negative on a loss
+        self.loss_count += 1
+        if self.martingale_step < MARTINGALE_LEVEL:
+            self.martingale_step += 1
+            self.stake = round(self.stake * MARTINGALE_FACTOR, 2)
         else:
-            setattr(state, f'_ks_repeat_{symbol}', 0)
-        return fired
-
-    @staticmethod
-    def _psi(expected: np.ndarray, actual: np.ndarray, n_bins: int = 10) -> float:
-        bins = np.percentile(expected, np.linspace(0, 100, n_bins + 1))
-        bins[0]  -= 1e-9
-        bins[-1] += 1e-9
-        exp_counts = np.histogram(expected, bins=bins)[0] + 1
-        act_counts = np.histogram(actual,   bins=bins)[0] + 1
-        exp_pct = exp_counts / exp_counts.sum()
-        act_pct = act_counts / act_counts.sum()
-        return float(np.sum((act_pct - exp_pct) * np.log(act_pct / exp_pct)))
-
-    @staticmethod
-    def check_psi(state: "TradeState", symbol: str,
-                  live_confidence: float) -> bool:
-        hist = state.drift_confidence_history[symbol]
-        hist.append(live_confidence)
-        if len(hist) < 100:
-            return False
-        ref = state.drift_reference_returns.get(f"conf_{symbol}")
-        if ref is None or len(ref) < 50:
-            return False
-        psi = DriftDetector._psi(ref, np.array(hist))
-        fired = psi > PSI_THRESHOLD
-        if fired:
-            vlog(f"[Drift/PSI] {symbol}: PSI={psi:.3f} > {PSI_THRESHOLD} "
-                  f"— confidence distribution shifted")
-        return fired
-
-    @staticmethod
-    def update_cusum(state: "TradeState", symbol: str, won: bool) -> bool:
-        outcome = 1.0 if won else 0.0
-        state.cusum_stat[symbol] = max(
-            0.0,
-            state.cusum_stat[symbol] + (0.5 - CUSUM_DRIFT) - outcome
-        )
-        fired = state.cusum_stat[symbol] > CUSUM_THRESHOLD
-        if fired:
-            vlog(f"[Drift/CUSUM] {symbol}: stat={state.cusum_stat[symbol]:.2f} "
-                  f"> {CUSUM_THRESHOLD} — sustained win-rate degradation")
-        return fired
-
-    @staticmethod
-    def snapshot_reference(state: "TradeState", symbol: str,
-                           returns: np.ndarray, confidences: List[float]):
-        """Call after each calibration to reset the reference distributions."""
-        state.drift_reference_returns[symbol]          = returns[-500:].copy()
-        state.drift_reference_returns[f"conf_{symbol}"] = np.array(confidences[-200:])
-        state.cusum_stat[symbol]   = 0.0
-        state.drift_degraded[symbol] = False
-        vlog(f"[Drift] {symbol}: reference snapshot saved "
-              f"({len(returns[-500:])} returns, {len(confidences[-200:])} conf scores)")
-
-    @staticmethod
-    def check_all(state: "TradeState", symbol: str,
-                  live_returns: np.ndarray, live_confidence: float) -> bool:
-        """Run all three detectors. Returns True if ANY fires."""
-        import time as _t
-        # FIX v3b: suppress ALL drift checks during post-calibration blackout.
-        # Root cause of perpetual recal loop: KS fired within 5 min of every
-        # calibration because fresh reference was immediately compared to live
-        # ticks that advanced during the ~27-min calibration run.
-        if _t.time() - state.last_calibration_end < POST_CALIBRATION_DRIFT_BLACKOUT:
-            return False
-        ks_fired  = DriftDetector.check_ks(state, symbol, live_returns)
-        psi_fired = DriftDetector.check_psi(state, symbol, live_confidence)
-        if ks_fired or psi_fired:
-            if not state.drift_degraded.get(symbol, False):
-                state.drift_degraded[symbol] = True
-                print(f"[Drift] {symbol}: DEGRADED — stake reduced to "
-                      f"{DRIFT_STAKE_REDUCTION:.0%} until recalibration")
-        return ks_fired or psi_fired
-
-
-# =============================================================================
-# v3 UPGRADE 2 — META-LEARNER FUSION
-# =============================================================================
-class MetaLearner:
-    """
-    Logistic regression meta-model that learns from OOS layer outputs → outcomes.
-
-    Input:  16-dimensional vector of layer signal values (same order as
-            online_update_layer_weights uses: markov, hmm, hawkes, ...)
-    Output: P(direction=+1) in [0, 1]
-    Training: online SGD with L2 regularisation after every step-0 trade.
-
-    Falls back to bayesian_fusion() transparently when fewer than
-    META_MIN_SAMPLES training examples exist for the symbol.
-
-    Architecture note: the meta-learner weights are stored in TradeState
-    (not SymbolModels) because they require live trade outcomes to train,
-    which only become available after the model is already deployed —
-    unlike the GARCH/HMM parameters which are fitted on tick history.
-    """
-
-    LAYER_KEYS = [
-        "markov", "hmm", "hawkes", "ou", "hurst", "arfima",
-        "kalman", "regime_strength", "rsi", "srsi", "adx", "boll",
-        "zscore", "vol_regime", "jump", "post_jump", "divergence"
-    ]
-    N_FEATURES = len(LAYER_KEYS)
-
-    @staticmethod
-    def feats_to_vector(feats: dict) -> np.ndarray:
-        """Extract the standardised 16-dim layer signal vector from a feats dict."""
-        v = np.array([
-            (feats.get("markov_p",    0.5) - 0.5) * 2,
-            feats.get("hmm_lean",      0.0),
-            feats.get("hawkes",        0.0),
-            feats.get("ou_dir",        0.0) * feats.get("ou_strength", 0.0),
-            feats.get("hurst_signal",  0.0),
-            feats.get("arfima_bias",   0.0),
-            feats.get("kalman",        0.0),
-            feats.get("regime_strength",  0.0),   # replaces copula
-            feats.get("rsi_signal",    0.0),
-            feats.get("srsi_signal",   0.0),
-            feats.get("adx_dir",       0.0) * feats.get("adx_trend", 0.0),
-            feats.get("boll_signal",   0.0),
-            feats.get("z_signal",      0.0),
-            feats.get("vol_regime",    0.0),   # replaces te_signal
-            feats.get("div_signal",    0.0),   # divergence (v3b)
-            feats.get("jump_dir",      0.0) * feats.get("jump_intensity", 0.0),
-            feats.get("post_jump",     0.0) * feats.get("jump_intensity", 0.0),
-        ], dtype=float)
-        return np.clip(v, -3.0, 3.0)
-
-    @staticmethod
-    def predict(state: "TradeState", symbol: str, x: np.ndarray) -> Optional[float]:
-        """
-        Returns P(up) from the meta-model, or None if not enough training data.
-        None signals the caller to fall back to bayesian_fusion().
-        """
-        w = state.meta_weights.get(symbol)
-        b = state.meta_bias.get(symbol, 0.0)
-        buf = state.meta_buffer[symbol]
-        if w is None or len(buf) < META_MIN_SAMPLES:
-            return None
-        return float(sigmoid(np.dot(w, x) + b))
-
-    @staticmethod
-    def update(state: "TradeState", symbol: str,
-               x: np.ndarray, direction: int, won: bool):
-        """
-        Online SGD step after a resolved step-0 trade.
-        Label: 1 if direction=+1 and won, or direction=-1 and lost (i.e. market went UP).
-        """
-        # Ground truth: did price go up? WIN on CALL or LOSS on PUT → went up
-        y = 1.0 if (direction == 1 and won) or (direction == -1 and not won) else 0.0
-
-        # Store example
-        state.meta_buffer[symbol].append((x.copy(), y))
-        buf = state.meta_buffer[symbol]
-
-        # Initialise weights if first example
-        if symbol not in state.meta_weights:
-            state.meta_weights[symbol] = np.zeros(MetaLearner.N_FEATURES)
-            state.meta_bias[symbol]    = 0.0
-
-        if len(buf) < META_MIN_SAMPLES:
-            return   # not enough data yet to do meaningful SGD
-
-        w = state.meta_weights[symbol]
-        b = state.meta_bias[symbol]
-        p = float(sigmoid(np.dot(w, x) + b))
-        err = p - y   # prediction error
-
-        # Gradient step with L2 regularisation
-        grad_w = err * x + META_L2 * w
-        grad_b = err
-        state.meta_weights[symbol] = w - META_LEARNING_RATE * grad_w
-        state.meta_bias[symbol]    = b - META_LEARNING_RATE * grad_b
-
-    @staticmethod
-    def retrain_from_buffer(state: "TradeState", symbol: str):
-        """
-        Full batch retrain from the rolling buffer after each calibration.
-        Uses mini-batch gradient descent (50 epochs) to avoid cold-start lag
-        after a recalibration resets the model.
-        """
-        buf = list(state.meta_buffer[symbol])
-        if len(buf) < META_MIN_SAMPLES:
-            return
-        X = np.array([x for x, _ in buf])
-        y = np.array([lbl for _, lbl in buf])
-        w = state.meta_weights.get(symbol, np.zeros(MetaLearner.N_FEATURES))
-        b = state.meta_bias.get(symbol, 0.0)
-
-        lr = META_LEARNING_RATE * 0.3   # lower LR for batch to avoid oscillation
-        for _ in range(50):
-            preds = sigmoid(X @ w + b)
-            errs  = preds - y
-            w     = w - lr * (X.T @ errs / len(y) + META_L2 * w)
-            b     = b - lr * np.mean(errs)
-
-        state.meta_weights[symbol] = w
-        state.meta_bias[symbol]    = float(b)
-        vlog(f"[MetaLearner] {symbol}: batch retrained on {len(buf)} examples")
-
-
-# =============================================================================
-# v3 UPGRADE 3 — CONFIDENCE CALIBRATION
-# =============================================================================
-class ConfidenceCalibrator:
-    """
-    Post-hoc calibration of raw model confidence scores so that stated
-    confidence closely matches empirical win rates.
-
-    Two methods, selected by data availability:
-    1. Temperature scaling: single-parameter T divides the log-odds of p_up.
-       p_calibrated = sigmoid(log_odds(p_up) / T)
-       T > 1 softens (reduces overconfidence), T < 1 sharpens.
-       Fits T by minimising negative log-likelihood on OOS data.
-       Preferred when n_samples >= 50.
-
-    2. Isotonic regression (fallback): monotonic mapping from raw confidence
-       to empirical win rate in equal-frequency bins. No parametric assumption.
-       Used when temperature fit has high residual or data is limited.
-
-    After calibration, Kelly sizing uses calibrated_confidence → real expected
-    win rate rather than the raw overconfident estimate.
-    """
-
-    @staticmethod
-    def fit_temperature(confidences: np.ndarray, outcomes: np.ndarray) -> float:
-        """
-        Fit temperature T that minimises NLL(outcomes | sigmoid(logit(conf)/T)).
-        confidences: raw p_up values in (0,1)
-        outcomes: 1=win, 0=loss
-        Returns T (positive float). T=1.0 means no calibration needed.
-        """
-        if len(confidences) < 50:
-            return 1.0
-        # logit of raw confidence
-        p = np.clip(confidences, 0.01, 0.99)
-        logits = np.log(p / (1 - p))
-        y = outcomes.astype(float)
-
-        def nll(T):
-            T = max(T[0], 0.1)
-            p_cal = sigmoid(logits / T)
-            return -float(np.mean(y * np.log(p_cal + 1e-9) +
-                                  (1-y) * np.log(1 - p_cal + 1e-9)))
-
-        res = minimize(nll, x0=[1.0], method="Nelder-Mead",
-                       options={"xatol": 1e-4, "maxiter": 200})
-        T = float(max(res.x[0], 0.1))
-        vlog(f"[Calibrate] Temperature T={T:.3f} "
-              f"({'soften' if T>1.1 else 'sharpen' if T<0.9 else 'neutral'})")
-        return T
-
-    @staticmethod
-    def fit_isotonic(confidences: np.ndarray,
-                     outcomes: np.ndarray, n_bins: int = 10) -> Optional[tuple]:
-        """
-        Fit a piecewise-monotonic mapping in n_bins equal-frequency bins.
-        Returns (bin_edges, bin_win_rates) tuple or None if insufficient data.
-        """
-        if len(confidences) < 50:
-            return None
-        idx  = np.argsort(confidences)
-        c    = confidences[idx]
-        y    = outcomes[idx].astype(float)
-        edges, rates = [], []
-        for i in range(n_bins):
-            lo = i * len(c) // n_bins
-            hi = (i+1) * len(c) // n_bins
-            edges.append(float(c[lo]))
-            rates.append(float(np.mean(y[lo:hi])) if hi > lo else 0.5)
-        edges.append(float(c[-1]) + 1e-6)
-        # Enforce monotonicity with pool-adjacent-violators
-        for i in range(1, len(rates)):
-            if rates[i] < rates[i-1]:
-                merged = (rates[i-1] + rates[i]) / 2
-                rates[i-1] = rates[i] = merged
-        return (np.array(edges), np.array(rates))
-
-    @staticmethod
-    def calibrate(p_up: float, state: "TradeState", symbol: str) -> float:
-        """
-        Apply temperature scaling (primary) then isotonic clamp (secondary).
-        Returns calibrated probability in (0.01, 0.99).
-        """
-        T = state.cal_temperature.get(symbol, 1.0)
-        # Temperature scaling
-        logit = math.log(max(p_up, 0.01) / max(1 - p_up, 0.01))
-        p_cal = float(sigmoid(logit / T))
-
-        # Isotonic clamp (if fitted)
-        iso = state.cal_isotonic.get(symbol)
-        if iso is not None:
-            edges, rates = iso
-            idx = np.searchsorted(edges, p_cal, side="right") - 1
-            idx = int(np.clip(idx, 0, len(rates) - 1))
-            # Blend: 70% isotonic, 30% temperature-scaled
-            p_cal = 0.70 * rates[idx] + 0.30 * p_cal
-
-        return float(np.clip(p_cal, 0.01, 0.99))
-
-    @staticmethod
-    def fit_and_save(state: "TradeState", symbol: str,
-                     raw_p_ups: List[float], outcomes: List[float]):
-        """Fit temperature + isotonic calibrators from OOS prediction history."""
-        if len(raw_p_ups) < 50:
-            return
-        conf  = np.array(raw_p_ups)
-        y     = np.array(outcomes)
-        T     = ConfidenceCalibrator.fit_temperature(conf, y)
-        iso   = ConfidenceCalibrator.fit_isotonic(conf, y)
-        state.cal_temperature[symbol] = T
-        state.cal_isotonic[symbol]    = iso
-
-
-# =============================================================================
-# v3 UPGRADE 5 — PORTFOLIO RISK ALLOCATOR
-# =============================================================================
-class PortfolioAllocator:
-    """
-    Replaces best-signal-wins with simultaneous multi-symbol capital allocation.
-
-    Algorithm:
-      1. Score all symbols by (calibrated_p_up, confidence, reliability).
-      2. Estimate pairwise return correlations from recent tick history.
-      3. Assign each symbol a base Kelly fraction from its calibrated edge.
-      4. Apply correlation penalty: if two symbols have corr > PORTFOLIO_HIGH_CORR,
-         reduce both stakes by (1 - corr) so their combined risk ≤ single-symbol risk.
-      5. Scale stakes so total risk ≤ PORTFOLIO_MAX_TOTAL_RISK × balance.
-      6. Return a list of (symbol, direction, stake, duration) for simultaneous execution.
-
-    Max PORTFOLIO_MAX_CONCURRENT positions open at once.
-    Symbols already in open_positions are excluded from new allocation.
-    """
-
-    @staticmethod
-    def estimate_correlations(symbol_data: dict,
-                              symbols: List[str],
-                              window: int = PORTFOLIO_CORR_WINDOW) -> Dict:
-        corr_map = {}
-        ret_map  = {}
-        for s in symbols:
-            r = symbol_data[s].returns()
-            ret_map[s] = r[-window:] if len(r) >= window else r
-        for i, a in enumerate(symbols):
-            for b in symbols[i+1:]:
-                ra, rb = ret_map[a], ret_map[b]
-                n = min(len(ra), len(rb))
-                if n < 50:
-                    corr_map[(a,b)] = corr_map[(b,a)] = 0.0
-                    continue
-                c = float(np.corrcoef(ra[-n:], rb[-n:])[0, 1])
-                corr_map[(a,b)] = corr_map[(b,a)] = float(np.clip(c, -1, 1))
-        return corr_map
-
-    @staticmethod
-    def allocate(candidates: List[tuple],   # (symbol, direction, p_up_cal, confidence, exp_win, duration, nt)
-                 state: "TradeState",
-                 symbol_data: dict,
-                 balance: float) -> List[tuple]:   # [(symbol, direction, stake, duration, barrier_price, duration_unit)]
-        """
-        Returns allocations sorted by stake descending.
-        candidates must already have passed all signal gates.
-
-        `nt` (the 7th tuple field) is the dict returned by select_notouch_trade:
-        it carries the barrier price and, crucially, the LIVE-QUOTED
-        payout_ratio for that specific barrier — used here instead of the
-        rolling empirical average, since No Touch payout ratios swing far
-        more per-trade (barrier-dependent) than Rise/Fall's near-fixed ~0.88.
-        """
-        if not candidates:
-            return []
-
-        # Exclude symbols already in open positions
-        active = set(state.open_positions.keys())
-        cands  = [c for c in candidates if c[0] not in active]
-        if not cands:
-            return []
-
-        # Cap at portfolio max
-        cands = cands[:PORTFOLIO_MAX_CONCURRENT]
-
-        # Estimate correlations
-        syms = [c[0] for c in cands]
-        corr = PortfolioAllocator.estimate_correlations(
-            symbol_data, syms)
-
-        # Base Kelly fractions
-        allocs = []
-        for sym, direction, p_cal, confidence, exp_win, duration, nt in cands:
-            # Live-quoted payout ratio takes priority over the rolling average —
-            # it's the actual price Deriv is offering for THIS barrier right now.
-            payout = nt.get("payout_ratio") if nt else None
-            if not payout or payout <= 0:
-                payout = float(np.mean(state.payout_history.get(sym, [0.88]) or [0.88]))
-            p      = float(np.clip(exp_win, 0.01, 0.99))
-
-            # v3b: confidence gate — weak signals stay at floor stake
-            if confidence < KELLY_MIN_CONFIDENCE:
-                f_kel = MIN_STAKE / max(balance, 1.0)
-            else:
-                f_full = max(0.0, (p * payout - (1 - p)) / payout)
-                f_kel  = f_full * KELLY_FRACTION * 0.25  # quarter of quarter-Kelly in portfolio
-
-            # Hard cap at 1.5% per position inside the portfolio
-            f_kel = min(f_kel, KELLY_STAKE_CEILING_PCT)
-            allocs.append({
-                "symbol":    sym,
-                "direction": direction,
-                "duration":  duration,
-                "f_kelly":   f_kel,
-                "confidence": confidence,
-                "barrier_price": nt["barrier_price"] if nt else None,
-                "duration_unit": nt["duration_unit"] if nt else "t",
-            })
-
-        # Correlation penalty — reduce allocation for correlated pairs
-        for i in range(len(allocs)):
-            for j in range(i+1, len(allocs)):
-                a, b = allocs[i]["symbol"], allocs[j]["symbol"]
-                c = abs(corr.get((a, b), 0.0))
-                if c > PORTFOLIO_HIGH_CORR:
-                    penalty = 1.0 - (c - PORTFOLIO_HIGH_CORR) / (1 - PORTFOLIO_HIGH_CORR)
-                    allocs[i]["f_kelly"] *= penalty
-                    allocs[j]["f_kelly"] *= penalty
-                    vlog(f"[Portfolio] Corr({a},{b})={c:.2f} → "
-                          f"penalty={penalty:.2f} on both")
-
-        # Scale so total risk ≤ PORTFOLIO_MAX_TOTAL_RISK × balance
-        total_f = sum(a["f_kelly"] for a in allocs)
-        if total_f > PORTFOLIO_MAX_TOTAL_RISK:
-            scale = PORTFOLIO_MAX_TOTAL_RISK / total_f
-            for a in allocs:
-                a["f_kelly"] *= scale
-
-        # Convert to stakes
-        MIN_STAKE_LIVE = 0.35
-        result = []
-        for a in allocs:
-            stake = max(MIN_STAKE_LIVE, round(balance * a["f_kelly"], 2))
-            # Apply drift reduction if symbol is degraded
-            if state.drift_degraded.get(a["symbol"], False):
-                stake = max(MIN_STAKE_LIVE, round(stake * DRIFT_STAKE_REDUCTION, 2))
-            result.append((a["symbol"], a["direction"], stake, a["duration"],
-                           a["barrier_price"], a["duration_unit"]))
-
-        result.sort(key=lambda x: x[2], reverse=True)
-        print(f"[Portfolio] Allocating {len(result)} positions: "
-              + " | ".join(f"{s} ${stk:.2f}" for s, _, stk, _, _, _ in result))
-        return result
-
-
-def bayesian_fusion(features):
-    """Log-odds Bayesian evidence combination across all 18 layers.
-
-    WEIGHT HIERARCHY (highest to lowest precision):
-      1. Per-symbol weights learned from OOS correlation during deep calibration
-         (stored in features["per_layer_weights"]) — used when available.
-      2. Static defaults below — used as fallback for unlearned symbols.
-
-    Hurst contributes its own direct term (not just via ARFIMA) as the
-    momentum/reversion arbiter. New confirmation layers (RSI, StochRSI, ADX,
-    Bollinger, Z-score, Transfer entropy, Jump-diffusion) add incremental
-    evidence without overriding the core fitted-model signal.
-
-    trust_multiplier = vol_trust * entropy_trust gates the entire fusion:
-    high-volatility / high-entropy (near-random) conditions suppress all
-    evidence proportionally, not just individual layers."""
-
-    learned = features.get("per_layer_weights") or {}
-
-    def W(key, default):
-        """Return learned weight if available, else static default."""
-        return float(learned.get(key, default))
-
-    p_markov     = float(np.clip(features["markov_p"], 1e-3, 1 - 1e-3))
-    markov_logit = math.log(p_markov / (1 - p_markov))
-    trend_w      = features["trend_weight"]
-    hurst_w      = float(np.clip(features["hurst"], 0, 1))   # H itself as trust scalar
-
-    # ── Core fitted-model evidence ──────────────────────────────────────────
-    evidence = [
-        # (signal_scaled_to_logit_range, base_weight)
-        (markov_logit,                                          W("markov",   1.0)),
-        (features["hmm_lean"]    * 2.0,                        W("hmm",      trend_w)),
-        (features["hawkes"]      * 2.5,                        W("hawkes",   trend_w)),
-        (features["ou_dir"] * features["ou_strength"] * 2.0,  W("ou",       1 - trend_w)),
-        (features["hurst_signal"]* 1.2,                        W("hurst",    0.6)),   # ← direct Hurst term
-        (features["arfima_bias"] * 1.5,                        W("arfima",   0.55)),
-        (features["kalman"]      * 1.5,                        W("kalman",   0.65)),
-        (features["regime_strength"],                               W("regime", 0.55)),  # replaces copula
-    ]
-
-    # ── Confirmation layers (incremental, lower base weight) ────────────────
-    adx_trust     = features["adx_trend"]
-    momentum_mode = features.get("momentum_mode", False)
-    # When both RSI + StochRSI agree → boost; when they disagree → reduce
-    rsi_agree  = 1.0 if (features["rsi_signal"] * features["srsi_signal"]) >= 0 else 0.4
-    bz_agree   = 1.0 if (features["boll_signal"] * features["z_signal"])   >= 0 else 0.4
-    # Regime confidence: how decisively HMM+Hurst agree on the regime
-    regime_conf = float(np.clip(abs(trend_w - 0.5) * 2 + abs(hurst_w - 0.5) * 2, 0, 1))
-
-    evidence += [
-        (features["rsi_signal"],                                W("rsi",      0.35) * rsi_agree * (1 + regime_conf * 0.5)),
-        (features["srsi_signal"],                               W("srsi",     0.30) * rsi_agree * (1 + regime_conf * 0.5)),
-        # ADX now produces real signal after tick-data TR fix; scale by trend strength
-        (features["adx_dir"] * adx_trust,                      W("adx",      0.40) * (0.5 + adx_trust)),
-        (features["boll_signal"],                               W("boll",     0.30) * bz_agree * (1 + regime_conf * 0.4)),
-        (features["z_signal"],                                  W("zscore",   0.30) * bz_agree * (1 + regime_conf * 0.4)),
-        (features["vol_regime"],                                    W("vol_regime", 0.35)),  # replaces te
-        (features.get("div_signal", 0.0) * 1.5,                    W("divergence", 0.70)),  # v3b — new
-        (features["jump_dir"]    * features["jump_intensity"],  W("jump",     0.25)),
-        (features["post_jump"]   * features["jump_intensity"],  W("post_jump",0.20)),
-    ]
-
-    total_trust = features["vol_trust"] * features["entropy_trust"]
-    log_odds, total_weight = 0.0, 0.0
-    for log_ratio, weight in evidence:
-        w = float(weight) * total_trust
-        log_odds     += log_ratio * w
-        total_weight += abs(w)
-
-    # ── FIX v2: Direction balance correction ──────────────────────────────
-    # If recent signals are >80% one-directional it almost certainly reflects
-    # a structural layer bias rather than a genuine edge. A soft correction
-    # pushes log_odds back toward zero (capped at ±0.5 so it cannot flip a
-    # genuinely strong signal). The root-cause fix (Hurst on returns) removes
-    # the bias at source; this is a safety net against future regressions.
-    direction_ratio = float(features.get("recent_call_ratio", 0.5))
-    if direction_ratio > 0.80:
-        log_odds -= float(np.clip((direction_ratio - 0.80) * 5.0, 0.0, 0.5))
-    elif direction_ratio < 0.20:
-        log_odds += float(np.clip((0.20 - direction_ratio) * 5.0, 0.0, 0.5))
-
-    p_up       = float(np.clip(1.0 / (1.0 + math.exp(-log_odds)), 0.01, 0.99))
-    confidence = abs(p_up - 0.5) * 2.0 * total_trust
-    return p_up, confidence
+            self.martingale_step = 0
+            self.stake = FIRST_STAKE
+
+    def should_stop(self):
+        if self.total_profit >= TARGET_PROFIT:
+            return "target_profit"
+        if self.total_profit <= -STOP_LOSS:
+            return "stop_loss"
+        return None
 
 
 # ---------------------------------------------------------------------------
-# SELF-IMPROVEMENT: ONLINE LAYER WEIGHT UPDATE
-# Nudges each layer's fusion weight ±4% after every step-0 trade outcome.
-# Runs between calibrations so the bot adapts continuously from live results.
-#
-# Rule: won+agreed → reward (↑), won+opposed → punish (↓),
-#       lost+agreed → punish (↓), lost+opposed → reward (↑)
+# MAIN LOOP
 # ---------------------------------------------------------------------------
-def online_update_layer_weights(models: SymbolModels, feats: dict,
-                                direction: int, won: bool, lr: float = 0.04):
-    if models is None or feats is None:
-        return
-    layer_signals = {
-        "markov":    (feats.get("markov_p",     0.5) - 0.5) * 2,
-        "hmm":        feats.get("hmm_lean",      0),
-        "hawkes":     feats.get("hawkes",         0),
-        "ou":         feats.get("ou_dir",         0) * feats.get("ou_strength", 0),
-        "hurst":      feats.get("hurst_signal",   0),
-        "arfima":     feats.get("arfima_bias",    0),
-        "kalman":     feats.get("kalman",         0),
-        "regime":     feats.get("regime_strength", 0.0),
-        "rsi":        feats.get("rsi_signal",     0),
-        "srsi":       feats.get("srsi_signal",    0),
-        "adx":        feats.get("adx_dir",        0) * feats.get("adx_trend", 0),
-        "boll":       feats.get("boll_signal",    0),
-        "zscore":     feats.get("z_signal",       0),
-        "vol_regime":  feats.get("vol_regime",     0.0),
-        "divergence":  feats.get("div_signal",     0.0),
-        "jump":       feats.get("jump_dir",       0) * feats.get("jump_intensity", 0),
-        "post_jump":  feats.get("post_jump",      0) * feats.get("jump_intensity", 0),
-    }
-    w       = dict(models.per_layer_weights or {})
-    outcome = 1 if won else -1
-    for layer, signal in layer_signals.items():
-        if abs(signal) < 0.01:
+async def tick_consumer(client, candles: Dict[str, SymbolCandles]):
+    q = client.subscribe_channel("tick")
+    while True:
+        data = await q.get()
+        t = data.get("tick")
+        if not t:
             continue
-        agreement = 1 if signal * direction > 0 else -1
-        reward    = outcome * agreement
-        current_w = w.get(layer, 1.0)
-        w[layer]  = float(np.clip(current_w + lr * reward * abs(current_w), 0.05, 3.0))
-    models.per_layer_weights = w
-
-
-# ---------------------------------------------------------------------------
-# SELF-IMPROVEMENT: AUTO-TUNE ENTRY GATES
-# Adjusts MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE from the
-# rolling step-0 win rate. Called every 50 step-0 trades and post-calibration.
-# Gate changes are persisted to Supabase so Railway restarts inherit them.
-# ---------------------------------------------------------------------------
-def autotune_gates(state):
-    global MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE
-    total_wins   = sum(state.step0_wins.values())
-    total_trades = sum(state.step0_total.values())
-
-    # FIX v3: only autotune on CURRENT SESSION trades — never on stale
-    # Supabase-loaded step0 counts from prior runs. Autotune was reading 52
-    # historical trades with 40.4% win rate and tightening to 14/1 — a
-    # threshold impossible to clear — because the historical win rate was
-    # computed on v2 which had broken layers. Track session-only trades via
-    # a session counter that resets to 0 on startup (not loaded from Supabase).
-    session_trades = getattr(state, '_session_trades', 0)
-    if session_trades < 30:
-        vlog(f"[AutoTune] Only {session_trades} session trades — skipping tune "
-              f"(need 30 from this session to avoid stale-data tightening).")
-        return
-
-    if total_trades < 50:
-        return
-
-    wr = total_wins / total_trades
-    changed = False
-    if wr < 0.46:
-        new_agree = min(MIN_LAYER_AGREE + 1, 14)
-        new_dis   = max(MAX_LAYER_DISAGREE - 1, 1)
-        new_mc    = min(MIN_EXP_WIN_RATE + 0.01, 0.58)
-        if (new_agree, new_dis, new_mc) != (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE):
-            MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE = new_agree, new_dis, new_mc
-            changed = True
-            vlog(f"[AutoTune] WR={wr:.3f} over {session_trades} session trades < 0.46 → "
-                  f"TIGHTENED: agree>={MIN_LAYER_AGREE} disagree<={MAX_LAYER_DISAGREE} "
-                  f"MC>={MIN_EXP_WIN_RATE:.2f}")
-    elif wr > 0.54 and session_trades >= 100:
-        new_agree = max(MIN_LAYER_AGREE - 1, 7)
-        new_dis   = min(MAX_LAYER_DISAGREE + 1, 6)
-        new_mc    = max(MIN_EXP_WIN_RATE - 0.01, 0.50)
-        if (new_agree, new_dis, new_mc) != (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE):
-            MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE = new_agree, new_dis, new_mc
-            changed = True
-            vlog(f"[AutoTune] WR={wr:.3f} over {session_trades} session trades > 0.54 → "
-                  f"RELAXED: agree>={MIN_LAYER_AGREE} disagree<={MAX_LAYER_DISAGREE} "
-                  f"MC>={MIN_EXP_WIN_RATE:.2f}")
-    else:
-        vlog(f"[AutoTune] WR={wr:.3f} over {session_trades} session trades — gates unchanged "
-              f"({MIN_LAYER_AGREE}/{MAX_LAYER_DISAGREE}).")
-    if changed and _store:
-        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
-                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
-
-
-# ---------------------------------------------------------------------------
-# LAYER 12: MONTE CARLO DURATION SELECTOR
-# ---------------------------------------------------------------------------
-def monte_carlo_duration(prices, returns, direction, feats, candidate_durations, n_sims=MC_SIMULATIONS, models=None):
-    """Takes the direction already decided by the Bayesian layer (does NOT
-    re-decide direction) and simulates forward paths to find which duration
-    maximizes expected win probability.
-
-    OU reversion pull weighted by (1 - trend_weight) - same weighting Bayesian
-    fusion used when deciding direction, so MC never silently fights the chosen
-    direction (fixed the exp_win=0.00 bug from earlier logs).
-
-    When deep startup calibration has produced empirical per-duration win rates,
-    those are blended with the simulation estimate (70% sim / 30% empirical) so
-    duration selection is anchored to what actually happened on this symbol."""
-    if len(returns) < 20:
-        return candidate_durations[0], 0.5
-
-    cond_vol = feats.get("cond_vol")
-    vol = cond_vol if cond_vol and cond_vol > 0 else (np.std(returns[-50:]) if len(returns) >= 50 else np.std(returns))
-    vol = vol if vol > 0 else 1e-6
-
-    hawkes_signal = feats.get("hawkes", 0.0)
-    drift = direction * abs(np.mean(returns[-50:])) * (1 + abs(hawkes_signal) * 0.5) if len(returns) >= 50 else 0.0
-
-    ou_params = feats.get("ou_params")
-    trend_weight = feats.get("trend_weight", 0.5)
-    current_price = prices[-1]
-    reversion_pull = 0.0
-    if ou_params and ou_params.get("theta", 0) > 0:
-        raw_pull = ou_params["theta"] * (ou_params["mu"] - current_price) * 0.01
-        reversion_pull = raw_pull * (1 - trend_weight)
-
-    empirical = getattr(models, "empirical_duration_win_rates", {}) if models else {}
-
-    # ── Terminal displacement model ───────────────────────────────────────
-    # Deriv Rise/Fall settles on price[expiry] vs price[entry]. The correct
-    # model for the terminal displacement after `dur` independent ticks is:
-    #
-    #   X_T ~ N(drift * dur, vol * sqrt(dur))
-    #
-    # The old approach summed `dur` individual N(drift, vol) draws, which is
-    # mathematically identical to N(drift*dur, vol*sqrt(dur)) for the terminal
-    # value BUT it was computing wins as sum(steps)>0 rather than sampling from
-    # the correct terminal distribution — introducing a monotone duration bias
-    # where longer durations always won because drift accumulated faster than
-    # noise. Synthetic index RNG drift is effectively zero by design, so with
-    # drift≈0 all durations produce ~50% in simulation and the empirical 30%
-    # blend from deep calibration becomes the ONLY real differentiator.
-    best = None
-    for dur in candidate_durations:
-        # Sample terminal displacement directly — no tick-by-tick accumulation
-        terminal = np.random.normal(
-            (drift + reversion_pull) * dur,   # expected drift over dur ticks
-            vol * np.sqrt(dur),               # vol scales as sqrt(ticks)
-            size=n_sims
-        )
-        wins = np.sum(terminal > 0) if direction > 0 else np.sum(terminal < 0)
-        sim_win_rate = wins / n_sims
-
-        # FIX v2: Magnitude-weighted win rate.
-        # A naive win-count treats a path that ends barely past zero the same
-        # as one that ends far in favour of the direction. Borderline paths
-        # are weak evidence and inflate the apparent edge. Weighting by
-        # |terminal|/std down-weights borderline crossings and produces a
-        # sharper, more honest estimate of genuine directional conviction.
-        std_term = float(np.std(terminal)) + 1e-9
-        favourable = terminal if direction > 0 else -terminal
-        weights = 1.0 + np.tanh(np.abs(favourable) / std_term)
-        weighted_win_rate = float(
-            np.sum(weights * (favourable > 0)) / np.sum(weights)
-        )
-
-        # Blend: empirical (primary) + simulation win-rate (sim) + weighted overlay.
-        # Empirical still dominates at 70% when available; the remaining 30%
-        # is split between raw and magnitude-weighted simulation estimates.
-        sim_component = 0.5 * sim_win_rate + 0.5 * weighted_win_rate
-        blended = (0.30 * sim_component + 0.70 * empirical[dur]
-                   if dur in empirical and empirical[dur] > 0
-                   else sim_component)
-        if best is None or blended > best[1]:
-            best = (dur, blended)
-    return best
-
-
-# ---------------------------------------------------------------------------
-# FIX v2 — NEW: BOOTSTRAP META-ENSEMBLE MC (model-free second opinion)
-# ---------------------------------------------------------------------------
-# monte_carlo_duration() above is fully parametric: it assumes the terminal
-# displacement is Gaussian with drift/vol estimated from recent returns.
-# This bootstrap version instead resamples BLOCKS of actual historical
-# returns (preserving short-range autocorrelation structure) and is
-# completely model-free. When the parametric and bootstrap estimates
-# agree, the signal is much more likely to reflect genuine structure rather
-# than a parametric modelling artefact. Used as an additional soft check
-# before committing to a trade — see usage in the main loop.
-BOOTSTRAP_BLOCK_SIZE = 10
-BOOTSTRAP_N_PATHS    = 2000
-BOOTSTRAP_AGREE_TOL  = 0.08   # max allowed disagreement before flagging
-
-def bootstrap_mc_p_directional(returns, direction, duration, block_size=BOOTSTRAP_BLOCK_SIZE,
-                               n_paths=BOOTSTRAP_N_PATHS):
-    """
-    Model-free estimate of P(terminal move favours `direction`) at `duration`
-    ticks ahead, built by resampling contiguous blocks of historical returns.
-    """
-    returns = np.asarray(returns)
-    if len(returns) < block_size * 3:
-        return 0.5
-    n_blocks_needed = max(1, (duration + block_size - 1) // block_size)
-    max_start = max(1, len(returns) - block_size)
-    outcomes = np.empty(n_paths)
-    for i in range(n_paths):
-        idx = np.random.randint(0, max_start, size=n_blocks_needed)
-        sampled = np.concatenate([returns[j:j + block_size] for j in idx])[:duration]
-        terminal_logret = float(np.sum(sampled))
-        outcomes[i] = terminal_logret
-    favourable = outcomes if direction > 0 else -outcomes
-    return float(np.mean(favourable > 0))
-
-
-def meta_ensemble_agrees(returns, direction, duration, parametric_p,
-                         tol=BOOTSTRAP_AGREE_TOL):
-    """
-    Returns (agrees: bool, bootstrap_p: float).
-    If the model-free bootstrap estimate disagrees with the parametric MC
-    estimate by more than `tol`, the signal should be treated with extra
-    suspicion — the parametric model (Gaussian terminal displacement) may
-    not be capturing the symbol's actual return structure right now.
-    """
-    bootstrap_p = bootstrap_mc_p_directional(returns, direction, duration)
-    agrees = abs(bootstrap_p - parametric_p) <= tol
-    return agrees, bootstrap_p
-
-
-# ---------------------------------------------------------------------------
-# LAYER 12 (v4): MONTE CARLO NO-TOUCH BARRIER/DURATION SELECTOR
-# ---------------------------------------------------------------------------
-# Replaces monte_carlo_duration() for No Touch contracts. Instead of scanning
-# 1D duration candidates for P(terminal displacement favours direction), this
-# scans a 2D (barrier_sigma x duration) grid for P(price never touches the
-# barrier) — then confirms the top candidates against Deriv's ACTUAL priced
-# payout via a live `proposal` quote, and picks the highest-EV combination.
-#
-# The "safest" barrier (widest sigma) is deliberately excluded above
-# NOTOUCH_MAX_SAFE_PROB: P(no_touch) -> 1.0 means payout -> stake, i.e. an
-# EV close to zero regardless of how "sure" the barrier is.
-#
-# Confirmed Deriv NOTOUCH duration constraints (per symbol family):
-#   - R_* and 1HZ* symbols: ticks 5-10 ARE valid, plus minutes 2-60.
-#   - Any other symbol (e.g. BEAR/BULL): minutes 2-60 ONLY, no tick durations.
-# Since the two unit types (ticks vs minutes) aren't directly comparable,
-# everything is converted to an equivalent tick count internally using the
-# symbol's tick_dt (seconds/tick) before simulating — the human-readable
-# duration + unit is preserved separately for the actual Deriv API call.
-NOTOUCH_TICK_DURATIONS   = [5, 7, 10]                 # trimmed from 5-10 — 3 representative points
-NOTOUCH_MINUTE_DURATIONS = [3, 10, 20, 45]            # trimmed from 9 candidates to 4
-NOTOUCH_BARRIER_SIGMAS   = [0.5, 1.0, 1.5, 2.0, 3.0]   # trimmed from 7 to 5
-NOTOUCH_MAX_SAFE_PROB    = 0.90   # reject barriers so wide the payout is near-stake
-MC_NOTOUCH_SIMS          = 2000   # trimmed from 5000 — negligible accuracy cost, much faster
-
-
-def notouch_candidate_grid(symbol):
-    """Returns [(duration, duration_unit), ...] honoring Deriv's confirmed
-    NOTOUCH duration constraints: ticks (5-10) are only valid for R_/1HZ
-    symbols; BEAR/BULL (and anything else) get minutes only. Minutes (2-60)
-    are valid for every symbol."""
-    candidates = [(m, "m") for m in NOTOUCH_MINUTE_DURATIONS]
-    is_bear_bull = "BEAR" in symbol or "BULL" in symbol
-    if not is_bear_bull:
-        candidates = [(t, "t") for t in NOTOUCH_TICK_DURATIONS] + candidates
-    return candidates
-
-
-def monte_carlo_notouch(prices, returns, direction_bias, feats, candidate_grid, tick_dt=1.0,
-                         barrier_sigmas=NOTOUCH_BARRIER_SIGMAS,
-                         n_sims=MC_NOTOUCH_SIMS, models=None):
-    """
-    direction_bias is the layer stack's directional vote (+1 bullish / -1
-    bearish) — No Touch has no CALL/PUT direction, only a barrier side.
-    Bullish bias -> barrier placed BELOW price (betting it won't fall
-    through support). Bearish bias -> barrier placed ABOVE (won't rally
-    through resistance). This reuses the same directional conviction your
-    Bayesian fusion already produces; it just picks a side instead of a
-    CALL/PUT direction.
-
-    candidate_grid: [(duration, duration_unit), ...] e.g. from
-    notouch_candidate_grid(symbol) — may mix "t" (ticks) and "m" (minutes).
-    tick_dt: seconds per tick for this symbol (sd.tick_dt — 1.0 for 1HZ,
-    ~2.0 for R_) used to convert minute durations into an equivalent tick
-    count for path simulation, since `returns` is per-tick.
-
-    Returns a list of dicts: {sigma, duration, duration_unit, side,
-    barrier_price, p_no_touch}.
-    """
-    if len(returns) < 20:
-        return None
-
-    cond_vol = feats.get("cond_vol")
-    vol = cond_vol if cond_vol and cond_vol > 0 else (np.std(returns[-50:]) if len(returns) >= 50 else np.std(returns))
-    vol = max(vol, 1e-6)
-    current_price = prices[-1]
-
-    def to_ticks(dur, unit):
-        if unit == "t":
-            return int(dur)
-        if unit == "m":
-            return max(1, int(round(dur * 60.0 / tick_dt)))
-        if unit == "s":
-            return max(1, int(round(dur / tick_dt)))
-        raise ValueError(f"unknown NOTOUCH duration unit: {unit}")
-
-    tick_candidates = [(to_ticks(d, u), d, u) for d, u in candidate_grid]
-    max_ticks = max(tc[0] for tc in tick_candidates)
-
-    # Simulate log-return paths ONCE at the max horizon (in ticks), reuse
-    # prefixes for shorter durations via running min/max — avoids
-    # resimulating per grid cell.
-    step_returns  = np.random.normal(0.0, vol, size=(n_sims, max_ticks))
-    cum_log       = np.cumsum(step_returns, axis=1)
-    running_max   = np.maximum.accumulate(cum_log, axis=1)
-    running_min   = np.minimum.accumulate(cum_log, axis=1)
-
-    empirical = getattr(models, "empirical_notouch_win_rates", {}) if models else {}
-    results = []
-    for sigma_k in barrier_sigmas:
-        for n_ticks, dur, unit in tick_candidates:
-            scaled_vol = vol * np.sqrt(n_ticks)
-            log_dist   = sigma_k * scaled_vol
-            if direction_bias > 0:
-                barrier_log = -log_dist
-                touched = running_min[:, n_ticks - 1] <= barrier_log
-                side = "below"
-            else:
-                barrier_log = log_dist
-                touched = running_max[:, n_ticks - 1] >= barrier_log
-                side = "above"
-
-            p_no_touch = float(np.mean(~touched))
-            key = (round(sigma_k, 2), dur, unit)
-            if key in empirical and empirical[key] > 0:
-                # Same 70/30 empirical/sim blend convention as monte_carlo_duration.
-                p_no_touch = 0.70 * empirical[key] + 0.30 * p_no_touch
-
-            if p_no_touch >= NOTOUCH_MAX_SAFE_PROB:
-                continue   # too safe -> payout will be ~stake, not worth quoting
-
-            results.append({
-                "sigma":         round(float(sigma_k), 2),
-                "duration":      int(dur),
-                "duration_unit": unit,
-                "side":          side,
-                "barrier_price": round(float(current_price * np.exp(barrier_log)), 2),
-                "p_no_touch":    round(p_no_touch, 2),
-            })
-    return results
-
-
-async def quote_notouch(client, symbol, barrier_price, duration, duration_unit, stake):
-    """Live proposal quote — this is the ONLY source of truth for payout.
-    Deriv prices No Touch off its own volatility surface, not our GARCH
-    estimate, so we never assume a payout; we always ask for one. If the
-    barrier/duration pair is invalid for this symbol Deriv returns an error
-    and we simply skip that candidate — no need to hardcode barrier limits."""
-    req = {
-        "proposal": 1,
-        "amount": round(float(stake), 2),
-        "basis": "stake",
-        "contract_type": "NOTOUCH",
-        "currency": "USD",
-        "duration": int(duration),
-        "duration_unit": duration_unit,
-        "symbol": symbol,
-        "barrier": f"{barrier_price:.2f}",
-    }
-    resp = await client.send(req)
-    if "error" in resp:
-        return None
-    p = resp["proposal"]
-    return {
-        "payout":       round(float(p["payout"]), 2),
-        "ask_price":    round(float(p["ask_price"]), 2),
-        "proposal_id":  p["id"],
-    }
-
-
-async def select_notouch_trade(client, symbol, prices, returns, direction_bias, feats,
-                                stake, tick_dt=1.0, models=None, top_k=6):
-    """Replaces monte_carlo_duration() at the call sites. Grid-searches
-    (barrier, duration) with the MC over this symbol's ACTUAL valid duration
-    grid (ticks 5-10 for R_/1HZ, minutes 2-60 for everything), then confirms
-    the top-P(no_touch) candidates against Deriv's live priced payout, and
-    returns the one with the highest live EV — NOT the one with the highest
-    P(no_touch). A wide "safe" barrier with a payout barely above stake will
-    lose to a tighter barrier that Deriv actually pays well for.
-
-    Returns None if nothing qualifies, else a dict with sigma, duration,
-    duration_unit, side, barrier_price, p_no_touch, payout, ask_price,
-    proposal_id, payout_ratio, ev — everything the caller needs to place
-    the trade.
-    """
-    candidate_grid = notouch_candidate_grid(symbol)
-    grid = monte_carlo_notouch(prices, returns, direction_bias, feats, candidate_grid,
-                                tick_dt=tick_dt, models=models)
-    if not grid:
-        return None
-
-    # IMPORTANT: do not just take the top-N by p_no_touch — that always
-    # picks the safest/widest barriers, which is exactly where Deriv's
-    # payout converges closest to fair odds and leaves the least room for
-    # edge. Instead sample a spread across the whole sigma range (tight/
-    # risky through wide/safe) so a genuine edge in the middle of the
-    # distribution actually gets a chance to be found and quoted.
-    grid.sort(key=lambda g: g["sigma"])
-    if len(grid) <= top_k:
-        sampled = grid
-    else:
-        step = len(grid) / top_k
-        sampled = [grid[int(i * step)] for i in range(top_k)]
-
-    best = None
-    for cand in sampled:
-        q = await quote_notouch(client, symbol, cand["barrier_price"],
-                                 cand["duration"], cand["duration_unit"], stake)
-        if q is None:
+        symbol = t.get("symbol")
+        sc = candles.get(symbol)
+        if sc is None:
             continue
-        payout_ratio = round(q["payout"] / q["ask_price"], 2) if q["ask_price"] > 0 else 0.0
-        ev = round(cand["p_no_touch"] * payout_ratio - 1.0, 2)
-        if best is None or ev > best["ev"]:
-            best = {**cand, **q, "payout_ratio": payout_ratio, "ev": ev}
-    return best
+        sc.add_tick(float(t["epoch"]), float(t["quote"]))
 
 
-async def buy_notouch_contract(client, symbol, barrier_price, duration, duration_unit, stake):
-    """Re-quotes fresh (proposal IDs are short-lived) and buys at that price.
-    Returns (contract_id, actual_payout, actual_ask_price)."""
-    q = await quote_notouch(client, symbol, barrier_price, duration, duration_unit, stake)
-    if q is None:
-        raise RuntimeError(f"NOTOUCH proposal no longer valid for {symbol} barrier={barrier_price:.2f}")
-    resp = await client.send({"buy": q["proposal_id"], "price": round(float(stake), 2)})
-    if "error" in resp:
-        raise RuntimeError(resp["error"].get("message", "buy failed"))
-    return resp["buy"]["contract_id"], q["payout"], q["ask_price"]
-
-
-# ---------------------------------------------------------------------------
-# v3: UNIFIED SIGNAL FUSION — meta-learner with Bayesian fallback
-# ---------------------------------------------------------------------------
-def fuse_signal(features: dict, state: "TradeState",
-                symbol: str) -> Tuple[float, float]:
-    """
-    Primary signal fusion entry point for all signal evaluation in the bot.
-    Routes to MetaLearner when enough training data exists; otherwise falls
-    back to bayesian_fusion transparently.
-
-    Also applies confidence calibration to the output probability before
-    returning, so all downstream Kelly sizing uses calibrated estimates.
-
-    Returns: (p_up_calibrated, confidence)
-    """
-    x = MetaLearner.feats_to_vector(features)
-    meta_p = MetaLearner.predict(state, symbol, x)
-
-    if meta_p is not None:
-        # Meta-learner path
-        n = len(state.meta_buffer[symbol])
-        p_up = meta_p
-        confidence = abs(p_up - 0.5) * 2.0 * features.get("vol_trust", 1.0) \
-                     * features.get("entropy_trust", 1.0)
-        if n >= META_MIN_SAMPLES and n % 200 == 0:
-            # Periodic log of meta-learner usage
-            vlog(f"[MetaLearner] {symbol}: active ({n} samples), "
-                  f"p_up={p_up:.3f}")
-    else:
-        # Bayesian fallback
-        p_up, confidence = bayesian_fusion(features)
-
-    # Apply confidence calibration
-    p_up_cal = ConfidenceCalibrator.calibrate(p_up, state, symbol)
-    # Recalculate confidence from calibrated p_up
-    confidence_cal = abs(p_up_cal - 0.5) * 2.0 * features.get("vol_trust", 1.0) \
-                     * features.get("entropy_trust", 1.0)
-
-    return p_up_cal, confidence_cal
-
-
-# ---------------------------------------------------------------------------
-# LAYER AGREEMENT GATE
-# ---------------------------------------------------------------------------
-def passes_layer_gate(feats, direction):
-    """Returns (passes: bool, agree: int, disagree: int, neutral: int).
-
-    v3b: Regime-conditional thresholds.
-    In a strong trending regime (high regime_strength) signals are plentiful
-    — raise the bar to 11/2 to ensure we only trade the cleanest ones.
-    In a ranging/noisy regime (low regime_strength) genuine directional
-    signals are rare — relax to 8/5 so valid signals aren't over-filtered.
-    Default (neutral regime) uses the configured 9/4.
-    """
-    if direction > 0:
-        agree    = feats["agree_up"]
-        disagree = feats["disagree_up"]
-    else:
-        agree    = feats["disagree_up"]
-        disagree = feats["agree_up"]
-    neutral = feats["n_neutral"]
-
-    # Regime-conditional thresholds
-    rs = float(feats.get("regime_strength", 0.0))
-    if rs > 0.4:        # strong trending — signals cheap, raise bar
-        min_agree = min(MIN_LAYER_AGREE + 2, 13)
-        max_dis   = max(MAX_LAYER_DISAGREE - 1, 1)
-    elif rs < -0.2:     # ranging/noisy — signals rare, relax bar
-        min_agree = max(MIN_LAYER_AGREE - 1, 7)
-        max_dis   = min(MAX_LAYER_DISAGREE + 1, 6)
-    else:               # neutral regime — use configured defaults
-        min_agree = MIN_LAYER_AGREE
-        max_dis   = MAX_LAYER_DISAGREE
-
-    passes = (agree >= min_agree) and (disagree <= max_dis)
-    return passes, agree, disagree, neutral
-
-
-# ---------------------------------------------------------------------------
-# ENSEMBLE SELECTOR
-# ---------------------------------------------------------------------------
-def select_trade(symbol_scores, reliability, global_threshold, per_symbol_threshold=None):
-    """Selects the single strongest-signal symbol that clears its own
-    per-symbol threshold (derived from that symbol's OOS confidence
-    distribution during deep calibration). Falls back to the global threshold
-    for symbols without a calibrated per-symbol value.
-
-    Per-symbol thresholds mean a symbol with naturally lower confidence scores
-    (e.g. R_10 which is more random) gets judged against its own distribution,
-    not penalised against a global bar set by a more predictable symbol."""
-    per_sym_thr = per_symbol_threshold or {}
-    scored = []
-    for symbol, (p_up, confidence) in symbol_scores.items():
-        score     = confidence * reliability.get(symbol, 1.0)
-        direction = 1 if p_up > 0.5 else -1
-        thr       = per_sym_thr.get(symbol, global_threshold)
-        scored.append((symbol, direction, p_up, score, thr))
-
-    if not scored:
-        return None
-
-    # Filter: each symbol must clear its own threshold
-    scored = [s for s in scored if s[3] >= s[4]]
-    if not scored:
-        return None
-
-    scored.sort(key=lambda x: x[3], reverse=True)
-    top = scored[0]
-
-    # Gap check: top scorer must lead runner-up meaningfully
-    if len(scored) > 1 and (top[3] - scored[1][3]) < MIN_SCORE_GAP:
-        return None
-
-    return top[:4]   # (symbol, direction, p_up, score)
-
-
-# ---------------------------------------------------------------------------
-# STAKING
-# ---------------------------------------------------------------------------
-def calculate_stake(balance):
-    """stake = max($0.35, 2% of balance) - single formula, no seam/discontinuity.
-    Used as the FLOOR/fallback stake. See kelly_adjusted_stake() for the
-    edge-aware sizing now used at the call site."""
-    return round(max(MIN_STAKE, balance * STAKE_PCT), 2)
-
-
-# ---------------------------------------------------------------------------
-# FIX v2 — NEW: FRACTIONAL KELLY STAKE SIZING
-# ---------------------------------------------------------------------------
-# The fixed 2%-of-balance formula above sizes every trade identically
-# regardless of how strong the signal is. Fractional Kelly instead scales
-# the stake with the model's own estimated edge, so high-conviction signals
-# get proportionally more capital and marginal signals get less — without
-# ever exceeding a hard ceiling.
-#
-# Binary option Kelly: f* = (p * b - (1 - p)) / b
-#   p = model's estimated win probability (exp_win_rate from MC, NOT raw p_up)
-#   b = net payout ratio (e.g. 0.95 for a 95%-payout contract)
-# Quarter-Kelly (fraction=0.25) is used to keep variance survivable.
-KELLY_FRACTION         = 0.25
-KELLY_DEFAULT_PAYOUT   = 0.88
-KELLY_MIN_HISTORY      = 15
-# v3b: lowered from 4% → 1.5%. Live logs showed $231 stakes on 52% win-rate
-# signals with confidence=0.013. Quarter-Kelly on MC edge alone is too
-# aggressive when calibrated confidence is near zero.
-KELLY_STAKE_CEILING_PCT = 0.015
-# Below this confidence the signal is too weak to scale Kelly — use floor stake
-KELLY_MIN_CONFIDENCE    = 0.05
-
-def record_payout(state, symbol, stake, profit, won):
-    """Call after every resolved step-0 trade to update the empirical payout
-    ratio used by kelly_adjusted_stake(). Only winning trades carry payout
-    information (losing trades return profit=-stake, which is not payout)."""
-    if won and stake > 0:
-        ratio = profit / stake
-        hist = state.payout_history[symbol]
-        hist.append(ratio)
-        if len(hist) > 50:
-            hist.pop(0)
-
-
-def empirical_payout(state, symbol):
-    """Returns the rolling average payout ratio for a symbol, or the
-    conservative default if not enough history exists yet."""
-    hist = state.payout_history.get(symbol, [])
-    if len(hist) < KELLY_MIN_HISTORY:
-        return KELLY_DEFAULT_PAYOUT
-    return float(np.mean(hist))
-
-
-def kelly_adjusted_stake(balance, exp_win_rate, symbol, state,
-                          confidence: float = 0.0):
-    """
-    v3b: Confidence-gated fractional Kelly sizing.
-    When confidence < KELLY_MIN_CONFIDENCE the MC edge estimate is too noisy
-    to trust — return floor stake only. This prevents the 31 stake on a
-    confidence=0.013 signal seen in live logs (essentially noise level).
-    KELLY_STAKE_CEILING_PCT also lowered 4% → 1.5%.
-    """
-    if confidence < KELLY_MIN_CONFIDENCE:
-        return round(max(MIN_STAKE, calculate_stake(balance)), 2)
-
-    payout  = empirical_payout(state, symbol)
-    p       = float(np.clip(exp_win_rate, 0.01, 0.99))
-    f_full  = (p * payout - (1 - p)) / payout
-    f_full  = max(0.0, f_full)
-    f_kelly = f_full * KELLY_FRACTION
-
-    raw_stake = max(balance * f_kelly, calculate_stake(balance))
-    ceiling   = balance * KELLY_STAKE_CEILING_PCT
-    return round(max(MIN_STAKE, min(raw_stake, ceiling)), 2)
-
-
-def martingale_stakes(base_stake):
-    stakes = [round(base_stake, 2)]
-    for _ in range(MARTINGALE_MAX_STEPS):
-        stakes.append(round(stakes[-1] * MARTINGALE_FACTOR, 2))
-    return stakes
-
-
-# ---------------------------------------------------------------------------
-# TRADE EXECUTION
-# ---------------------------------------------------------------------------
-def explain_signal(symbol, direction, feats, p_up, confidence, duration, exp_win, score):
-    """Prints a human-readable breakdown of WHY this trade was taken —
-    which layers drove the signal, how strongly, and what the ensemble
-    concluded. Logged once at entry before the contract is placed."""
-    side     = "CALL (UP)" if direction > 0 else "PUT (DOWN)"
-    ts       = datetime.utcnow().isoformat()
-    bar      = "█"
-    sep      = "─" * 60
-
-    def bar_str(val, width=20):
-        """Render a ±1 value as a centred ASCII bar."""
-        v     = float(np.clip(val, -1, 1))
-        mid   = width // 2
-        filled= int(abs(v) * mid)
-        if v >= 0:
-            return " " * mid + bar * filled + " " * (width - mid - filled)
-        else:
-            return " " * (mid - filled) + bar * filled + " " * mid + " " * (width - mid)
-
-    # Compile layer contributions into a ranked list
-    layer_signals = [
-        ("Markov chain",    (feats["markov_p"] - 0.5) * 2),
-        ("HMM regime",      feats["hmm_lean"]),
-        ("Hawkes momentum", feats["hawkes"]),
-        ("OU mean-rev",     feats["ou_dir"] * feats["ou_strength"]),
-        ("Hurst",           feats["hurst_signal"]),
-        ("ARFIMA long-mem", feats["arfima_bias"]),
-        ("Kalman trend",    feats["kalman"]),
-        ("Regime strength", feats["regime_strength"]),
-        ("RSI",             feats["rsi_signal"]),
-        ("StochRSI",        feats["srsi_signal"]),
-        ("ADX dir",         feats["adx_dir"] * feats["adx_trend"]),
-        ("Bollinger %B",    feats["boll_signal"]),
-        ("Z-score",         feats["z_signal"]),
-        ("Vol regime",      feats["vol_regime"]),
-        ("Divergence",      feats.get("div_signal", 0.0)),
-        ("Jump direction",  feats["jump_dir"] * feats["jump_intensity"]),
-        ("Post-jump rev",   feats["post_jump"] * feats["jump_intensity"]),
-    ]
-
-    # Sort by absolute contribution, strongest first
-    layer_signals.sort(key=lambda x: abs(x[1]), reverse=True)
-
-    # Count layers agreeing vs disagreeing with the final direction
-    agree    = sum(1 for _, v in layer_signals if v * direction > 0)
-    disagree = sum(1 for _, v in layer_signals if v * direction < 0)
-    neutral  = len(layer_signals) - agree - disagree
-
-    hurst_regime = ("persistent / trending" if feats["hurst"] > 0.55
-                    else "anti-persistent / mean-reverting" if feats["hurst"] < 0.45
-                    else "near-random walk")
-    hmm_regime   = ("trending"  if feats["trend_weight"] > 0.65
-                    else "ranging" if feats["trend_weight"] < 0.4
-                    else "mixed")
-    vol_state    = ("HIGH — signal down-weighted" if feats["vol_trust"] < 0.5
-                    else "ELEVATED" if feats["vol_trust"] < 0.75
-                    else "normal")
-    entropy_state= ("HIGH — low structure"  if feats["entropy_trust"] < 0.4
-                    else "MODERATE" if feats["entropy_trust"] < 0.65
-                    else "low — market is structured")
-    conf_mode    = ("MOMENTUM (RSI/StochRSI/Boll/Z-score follow trend)"
-                    if feats.get("momentum_mode") else
-                    "MEAN-REVERSION (RSI/StochRSI/Boll/Z-score fade extremes)")
-    adx_str      = (f"ADX={feats['adx_val']:.1f}  trend_str={feats['adx_trend']:.2f}"
-                    f"  dir={feats['adx_dir']:+.0f}")
-
-    print(f"\n{sep}")
-    print(f"  TRADE SIGNAL  {ts}")
-    print(sep)
-    print(f"  Symbol  : {symbol}   Direction : {side}")
-    print(f"  p(UP)   : {p_up:.4f}   Confidence: {confidence:.4f}   Score: {score:.4f}")
-    print(f"  Duration: {duration} ticks   MC exp. win rate: {exp_win:.2%}")
-    print(f"  Trust   : vol={feats['vol_trust']:.2f}  entropy={feats['entropy_trust']:.2f}  "
-          f"combined={feats['vol_trust']*feats['entropy_trust']:.2f}")
-    print("\n  Market regime:")
-    print(f"    Hurst H={feats['hurst']:.3f}  → {hurst_regime}")
-    print(f"    HMM trend_weight={feats['trend_weight']:.2f}  → {hmm_regime}")
-    print(f"    Confirmation mode → {conf_mode}")
-    print(f"    {adx_str}")
-    print(f"    Volatility state  → {vol_state}")
-    print(f"    Entropy state     → {entropy_state}")
-    print(f"\n  Layer breakdown  [{agree} agree | {disagree} disagree | {neutral} neutral]")
-    print(f"  {'Layer':<20}  {'Signal':>7}  {'Direction bar (±1)':^22}")
-    print(f"  {'-'*20}  {'-'*7}  {'-'*22}")
-    for name, val in layer_signals:
-        tag = "▲" if val * direction > 0 else ("▼" if val * direction < 0 else "─")
-        print(f"  {name:<20}  {val:>+.4f}  {bar_str(val)}  {tag}")
-    print(f"\n  Decision: {agree}/{len(layer_signals)} layers support {side}")
-    print(sep + "\n")
-
-
-def log_trade(symbol, direction, stake, won, profit, step):
-    ts   = datetime.utcnow().isoformat()
-    side = "CALL" if direction > 0 else "PUT"
-    print(f"[{ts}] {symbol} {side} step={step} stake={stake:.2f} "
-          f"won={won} profit={profit:+.2f}")
-
-
-def log_trade_summary(symbol, direction, stakes_used, profits, sequence_won,
-                      balance_before, balance_after, p_up, confidence, duration):
-    """Printed once after a full martingale sequence resolves (win or full loss).
-    Gives a compact but complete picture of what happened and what it cost."""
-    ts        = datetime.utcnow().isoformat()
-    side      = "CALL" if direction > 0 else "PUT"
-    n_steps   = len(stakes_used)
-    total_staked = sum(stakes_used)
-    net_pnl   = sum(profits)
-    outcome   = "✓ WON" if sequence_won else "✗ LOST ALL STEPS"
-    bal_delta = balance_after - balance_before
-    sep       = "─" * 60
-
-    print(f"\n{sep}")
-    print(f"  TRADE SUMMARY  {ts}")
-    print(sep)
-    print(f"  Symbol    : {symbol}   {side}   {duration} ticks")
-    print(f"  Signal    : p_up={p_up:.4f}   confidence={confidence:.4f}")
-    print(f"  Outcome   : {outcome}")
-    print(f"  Steps used: {n_steps} / {MARTINGALE_MAX_STEPS + 1}")
-    print(f"  {'Step':<6}  {'Stake':>8}  {'Result':>8}  {'P/L':>8}")
-    print(f"  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*8}")
-    for i, (s, p) in enumerate(zip(stakes_used, profits)):
-        result = "WIN" if p > 0 else "LOSS"
-        print(f"  {i:<6}  {s:>8.2f}  {result:>8}  {p:>+8.2f}")
-    print(f"  {'TOTAL':<6}  {total_staked:>8.2f}  {'':>8}  {net_pnl:>+8.2f}")
-    print(f"\n  Balance : {balance_before:.2f} → {balance_after:.2f}  ({bal_delta:+.2f})")
-    print(sep + "\n")
-
-
-async def execute_single_step(client, state, symbol, direction, stake, step, duration=5,
-                              feats=None, barrier=None, duration_unit="t"):
-    """Places exactly ONE trade and returns. Never loops to the next martingale
-    step — that decision belongs to the main signal loop, which waits for a
-    genuine quality entry before placing any recovery step.
-
-    feats: if supplied, the layer gate is re-evaluated atomically here as a
-    final check immediately before the buy request is sent. This prevents the
-    race where the gate blocks on tick N but the trade slips through on tick
-    N+1 before a fresh iteration runs the gate check again.
-
-    barrier: if supplied (a No Touch trade), places a NOTOUCH contract at
-    this barrier instead of a CALL/PUT. `direction` in that case is still the
-    directional BIAS used only for logging/state tracking, not the contract
-    side — No Touch has no direction, only a barrier."""
-    # ── Atomic final gate check ─────────────────────────────────────────────
-    if feats is not None:
-        gate_ok, n_agree, n_dis, _ = passes_layer_gate(feats, direction)
-        if not gate_ok:
-            print(f"[Gate/Atomic] {symbol} step={step} blocked at execution — "
-                  f"{n_agree} agree / {n_dis} disagree (gate moved between check and fire)")
-            state.trade_in_progress = False
-            return False, 0.0
-
-    state.trade_in_progress = True
-    won, profit = False, 0.0
-    try:
-        if barrier is not None:
-            contract_id, _payout, _ask = await buy_notouch_contract(
-                client, symbol, round(float(barrier), 2), int(duration), duration_unit, stake)
-        else:
-            contract_id = await buy_contract(client, symbol, direction, int(duration), "t", stake)
-        won, profit = await wait_for_contract_result(client, contract_id)
-        log_trade(symbol, direction, stake, won, profit, step)
-    except Exception as e:
-        print(f"[Trade] Error on {symbol} step={step}: {e}")
-
-    # accumulate into the sequence tracker for the summary log
-    state.seq_stakes.append(stake)
-    state.seq_profits.append(profit)
-
-    # step-0 raw signal win-rate tracking (honest edge measurement)
-    if step == 0:
-        state.step0_total[symbol] += 1
-        if won:
-            state.step0_wins[symbol] += 1
-
-        # FIX v2: Record direction into rolling history (max 30 entries).
-        # Used by bayesian_fusion's direction balance correction to detect
-        # and dampen systematic CALL/PUT bias in the signal layers.
-        state.direction_history.append(direction)
-        if len(state.direction_history) > 30:
-            state.direction_history.pop(0)
-
-        # Record empirical payout ratio for Kelly sizing.
-        record_payout(state, symbol, stake, profit, won)
-
-        # Log direction balance when history is sufficient
-        if len(state.direction_history) >= 10:
-            call_ratio = sum(1 for d in state.direction_history if d == 1) / len(state.direction_history)
-            if call_ratio > 0.80 or call_ratio < 0.20:
-                vlog(f"[DirectionBalance] ⚠ {call_ratio:.0%} CALL in last "
-                      f"{len(state.direction_history)} trades — bias correction active")
-
-        if feats is not None:
-            # ── Online layer weight update (Bayesian path) ─────────────────
-            models_ref = state.model_cache.get(symbol)
-            if models_ref is not None:
-                online_update_layer_weights(models_ref, feats, direction, won)
-
-            # ── v3: Meta-learner online update ─────────────────────────────
-            x = MetaLearner.feats_to_vector(feats)
-            MetaLearner.update(state, symbol, x, direction, won)
-
-            # ── v3: CUSUM drift update ─────────────────────────────────────
-            cusum_fired = DriftDetector.update_cusum(state, symbol, won)
-            if cusum_fired and not state.drift_degraded.get(symbol, False):
-                state.drift_degraded[symbol] = True
-                vlog(f"[Drift/CUSUM] {symbol}: stake reduced to "
-                      f"{DRIFT_STAKE_REDUCTION:.0%} until next recalibration")
-
-        # ── Persist trade to Supabase ───────────────────────────────────────
-        if _store is not None and feats is not None:
-            _store.save_trade(symbol, direction, step, stake, won, profit,
-                              state.seq_p_up, state.seq_confidence,
-                              state.seq_duration, feats)
-
-        # ── Auto-tune gates every 50 step-0 trades ─────────────────────────
-        state._trades_since_autotune += 1
-        state._session_trades        += 1
-
-        # ── v3b: Real-time reliability update ─────────────────────────────
-        # Calibration only updates reliability every 6 hours. Between
-        # calibrations, each resolved step-0 trade updates the symbol's
-        # reliability score using a rolling 20-trade window. Decays
-        # 30% toward the calibration baseline each update so it doesn't
-        # drift too far if calibration produced a different picture.
-        CAL_BASELINE = float(np.clip(
-            state.reliability.get(symbol, 1.0), 0.3, 1.5
-        ))
-        recent_trades = [
-            t for t in list(state.meta_buffer.get(symbol, []))[-20:]
-        ]
-        if len(recent_trades) >= 5:
-            recent_wins = sum(1 for _, lbl in recent_trades if lbl == 1.0)
-            recent_wr   = recent_wins / len(recent_trades)
-            live_rel    = float(np.clip(recent_wr / 0.5, 0.3, 1.5))
-            # Blend: 70% live, 30% calibration baseline
-            state.reliability[symbol] = round(
-                0.70 * live_rel + 0.30 * CAL_BASELINE, 4
-            )
-        if state._trades_since_autotune >= 50:
-            autotune_gates(state)
-            state._trades_since_autotune = 0
-
-    try:
-        bal_resp = await client.send({"balance": 1})
-        state.balance = bal_resp["balance"]["balance"]
-    except Exception:
-        pass
-
-    state.trade_in_progress = False
-    return won, profit
-
-
-def clear_recovery(state):
-    """Reset all recovery context fields — called on sequence win or exhaustion."""
-    state.recovery_step       = 0
-    state.recovery_stake      = 0.0
-    state.seq_stakes_committed = 0.0   # FIX v2: reset sequence loss guard
-
-
-def reset_sequence_accumulator(state, balance_now, p_up=0.5, confidence=0.0, duration=0):
-    """Called at the START of a new sequence (step=0 entry). Resets all
-    per-sequence tracking so the summary log reflects only this sequence."""
-    state.seq_stakes         = []
-    state.seq_profits        = []
-    state.seq_balance_before = balance_now
-    state.seq_p_up           = p_up
-    state.seq_confidence     = confidence
-    state.seq_duration       = duration
-
-
-def emit_sequence_summary(state, symbol, direction, sequence_won):
-    """Called at the END of a sequence. Prints the full trade summary."""
-    log_trade_summary(
-        symbol        = symbol,
-        direction     = direction,
-        stakes_used   = list(state.seq_stakes),
-        profits       = list(state.seq_profits),
-        sequence_won  = sequence_won,
-        balance_before= state.seq_balance_before,
-        balance_after = state.balance,
-        p_up          = state.seq_p_up,
-        confidence    = state.seq_confidence,
-        duration      = state.seq_duration,
-    )
-
-
-# ---------------------------------------------------------------------------
-# SYMBOL CALIBRATOR (trigger manager + FULL-POWER calibration engine)
-# ---------------------------------------------------------------------------
-def check_calibration_triggers(state, symbol_data=None):
-    """
-    v3: Event-driven recalibration trigger.
-    Fires when any symbol drift detector flags, or the 6-hour backstop elapses.
-    The fixed 2-hour timer from v2 is removed — stable regimes no longer cause
-    unnecessary recalibration; genuine regime shifts are caught faster.
-    Returns ("drift", flagged_symbols) | ("scheduled", None) | None.
-    """
-    now = time.time()
-    if now - state.last_calibration_end < CALIBRATION_COOLDOWN:
-        return None
-    flagged = [s for s, degraded in state.drift_degraded.items() if degraded]
-    if flagged:
-        print(f"[Recal] Drift detected on {flagged} — event-driven recalibration")
-        return "drift", flagged
-    if now - state.last_scheduled_calibration >= SCHEDULED_CALIBRATION_INTERVAL:
-        print("[Recal] 6-hour backstop elapsed — scheduled recalibration")
-        return "scheduled", None
-    return None
-
-
-def walk_forward_validate(sd, train_frac=0.8, horizon=5, step=5):
-    """REAL walk-forward validation: fit models on the first train_frac of the
-    buffered ticks only, then step through the held-out remainder tick by tick
-    (simulating live arrival), generating predictions from the FROZEN trained
-    models and comparing to realized direction `horizon` ticks later. Returns
-    (hit_rate, fitted_models, confidences) - the same models get cached for
-    live trading if validation passes a sane bar, and `confidences` (the raw
-    confidence score at each replayed point) feeds the adaptive threshold
-    calibration in run_calibration."""
-    n_ticks = len(sd.ticks)
-    if n_ticks < MIN_TICKS_FOR_FIT + 100:
-        return 0.5, None, []
-
-    split = max(MIN_TICKS_FOR_FIT, int(n_ticks * train_frac))
-    train_sd = sd.slice_copy(split)
-    models = fit_symbol_models(train_sd)
-    if not models.fitted:
-        return 0.5, None, []
-
-    eval_sd = sd.slice_copy(split)
-    remaining_ticks = list(sd.ticks)[split:]
-    hits, total = 0, 0
-    confidences = []
-    for i in range(0, len(remaining_ticks) - horizon, step):
-        eval_sd.add_tick(*remaining_ticks[i])
-        feats = compute_features(eval_sd, models, {sd.symbol: eval_sd.returns()})
-        if feats is None:
-            continue
-        p_up, confidence = bayesian_fusion(feats)
-        confidences.append(confidence)
-        predicted_dir = 1 if p_up > 0.5 else -1
-        current_price = remaining_ticks[i][1]
-        future_price = remaining_ticks[i + horizon][1]
-        actual_dir = 1 if future_price > current_price else -1
-        hits += int(predicted_dir == actual_dir)
-        total += 1
-
-    hit_rate = hits / total if total > 0 else 0.5
-    return hit_rate, models, confidences
-
-
-
-# ---------------------------------------------------------------------------
-# DEEP STARTUP CALIBRATION
-# ---------------------------------------------------------------------------
-def expanding_window_walk_forward(sd, n_folds=5, horizons=None, step=3):
-    """True expanding-window walk-forward: models are REFITTED at each fold
-    boundary on all data up to that point, then evaluated on the next unseen
-    window. Returns a full report including per-fold hit rates, per-duration
-    empirical win rates, per-layer correlations, and models fitted on the
-    complete dataset for live trading."""
-    if horizons is None:
-        horizons = CANDIDATE_DURATIONS
-
-    n_ticks = len(sd.ticks)
-    if n_ticks < MIN_TICKS_FOR_FIT * 2 + 100:
-        return None
-
-    all_ticks = list(sd.ticks)
-    fold_size = (n_ticks - MIN_TICKS_FOR_FIT) // (n_folds + 1)
-    if fold_size < 30:
-        return None
-
-    per_fold_hit_rates = []
-    per_duration_outcomes = defaultdict(lambda: [0, 0])
-    layer_outcomes = defaultdict(list)
-    all_confidences = []
-    all_p_ups       = []   # v3: for confidence calibration
-    all_outcomes    = []   # v3: for confidence calibration
-    mid_h = horizons[len(horizons) // 2]
-
-    for fold in range(n_folds):
-        train_end = MIN_TICKS_FOR_FIT + fold_size * (fold + 1)
-        test_end  = min(train_end + fold_size, n_ticks)
-        if test_end - train_end < 20:
-            continue
-
-        train_sd = sd.slice_copy(train_end)
-        models   = fit_symbol_models(train_sd)
-        if not models.fitted:
-            continue
-
-        eval_sd    = sd.slice_copy(train_end)
-        test_ticks = all_ticks[train_end:test_end]
-        hits_fold, total_fold = 0, 0
-
-        for i in range(0, len(test_ticks) - max(horizons), step):
-            eval_sd.add_tick(*test_ticks[i])
-            feats = compute_features(eval_sd, models, {sd.symbol: eval_sd.returns()})
-            if feats is None:
-                continue
-            p_up, confidence = bayesian_fusion(feats)
-            all_confidences.append(confidence)
-            all_p_ups.append(float(p_up))   # v3: raw p_up before calibration
-            predicted_dir = 1 if p_up > 0.5 else -1
-            current_price = test_ticks[i][1]
-
-            for h in horizons:
-                if i + h >= len(test_ticks):
-                    continue
-                future_price = test_ticks[i + h][1]
-                actual_dir   = 1 if future_price > current_price else -1
-                won = int(predicted_dir == actual_dir)
-                if h == mid_h:
-                    all_outcomes.append(float(won))   # v3: outcome for calibration
-                per_duration_outcomes[h][0] += won
-                per_duration_outcomes[h][1] += 1
-                if h == mid_h:
-                    hits_fold  += won
-                    total_fold += 1
-
-            # per-layer correlation data (mid horizon only) — all 18 layers
-            if i + mid_h < len(test_ticks):
-                actual_mid = 1 if test_ticks[i + mid_h][1] > current_price else -1
-                for layer, key in [
-                    ("markov",    "markov_p"),    ("hmm",       "hmm_lean"),
-                    ("hawkes",    "hawkes"),       ("ou",        "ou_dir"),
-                    ("hurst",     "hurst_signal"), ("arfima",    "arfima_bias"),
-                    ("kalman",    "kalman"),       ("regime_strength", "regime_strength"),
-                    ("vol_trust", "vol_trust"),    ("entropy",   "entropy_trust"),
-                    ("rsi",       "rsi_signal"),   ("srsi",      "srsi_signal"),
-                    ("adx",       "adx_dir"),      ("boll",      "boll_signal"),
-                    ("zscore",    "z_signal"),     ("vol_regime", "vol_regime"),
-                    ("jump",      "jump_dir"),     ("post_jump", "post_jump"),
-                    ("divergence", "div_signal"),
-                ]:
-                    val = feats.get(key)
-                    if val is not None:
-                        layer_outcomes[layer].append((float(val), actual_mid))
-
-        if total_fold > 0:
-            per_fold_hit_rates.append((fold, train_end, total_fold, hits_fold / total_fold))
-
-    if not per_fold_hit_rates:
-        return None
-
-    fold_hrs = [x[3] for x in per_fold_hit_rates]
-    per_duration_win_rates = {
-        dur: wins / total if total > 0 else 0.5
-        for dur, (wins, total) in per_duration_outcomes.items()
-    }
-    per_layer_correlations = {}
-    for layer, pairs in layer_outcomes.items():
-        if len(pairs) < 20:
-            continue
-        vals     = np.array([p[0] for p in pairs])
-        outcomes = np.array([1 if p[1] > 0 else 0 for p in pairs])
-        if np.std(vals) > 0:
-            per_layer_correlations[layer] = float(np.corrcoef(vals, outcomes)[0, 1])
-
-    best_models = fit_symbol_models(sd)
-
-    return {
-        "per_fold_hit_rates":      per_fold_hit_rates,
-        "per_duration_win_rates":  per_duration_win_rates,
-        "per_layer_correlations":  per_layer_correlations,
-        "mean_hit_rate":           float(np.mean(fold_hrs)),
-        "std_hit_rate":            float(np.std(fold_hrs)),
-        "all_confidences":         all_confidences,
-        "all_p_ups":               all_p_ups,      # v3: for confidence calibration
-        "all_outcomes":            all_outcomes,    # v3: for confidence calibration
-        "best_models":             best_models,
-        "is_tradeable":            float(np.mean(fold_hrs)) >= 0.46 and best_models.fitted,
-        "n_folds_completed":       len(per_fold_hit_rates),
-    }
-
-
-def check_model_stability(models, symbol):
-    """Audit fitted model parameters for physical sanity. Returns a list of
-    warning strings (empty = clean)."""
-    warns = []
-    if models.garch_result is not None:
-        try:
-            p = models.garch_result.params
-            alpha = p.get("alpha[1]", p.get("alpha", None))
-            beta  = p.get("beta[1]",  p.get("beta",  None))
-            if alpha is not None and beta is not None:
-                persistence = float(alpha) + float(beta)
-                if persistence >= 1.0:
-                    warns.append(f"GARCH persistence={persistence:.3f} >= 1.0 (non-stationary)")
-                elif persistence > 0.98:
-                    warns.append(f"GARCH persistence={persistence:.3f} near-unit-root")
-        except Exception:
-            pass
-    for label, h in [("up", models.hawkes_up), ("down", models.hawkes_down)]:
-        if h is not None:
-            alpha, beta = h.get("alpha", 0), h.get("beta", 1)
-            ratio = alpha / beta if beta > 0 else 999
-            if ratio >= 1.0:
-                warns.append(f"Hawkes {label}: branching ratio={ratio:.3f} >= 1.0 (explosive)")
-            elif ratio > 0.9:
-                warns.append(f"Hawkes {label}: branching ratio={ratio:.3f} near-critical")
-    if models.ou_params is not None:
-        theta = models.ou_params.get("theta", 0)
-        if theta <= 0:
-            warns.append(f"OU theta={theta:.4f} <= 0 (divergent)")
-    if models.hmm_model is not None:
-        try:
-            # FIX v2: fit_hmm() now actively avoids degenerate states via
-            # multi-seed fitting + automatic 2-state fallback, so this should
-            # rarely fire anymore. Kept as a safety-net diagnostic — if it
-            # still appears in logs after the fix, the fallback chain itself
-            # failed and is worth investigating directly.
-            for i, p in enumerate(models.hmm_model.get_stationary_distribution()):
-                if p < 0.05:
-                    warns.append(f"HMM state {i} stationary prob={p:.3f} (degenerate)")
-        except Exception:
-            pass
-    return warns
-
-
-async def deep_startup_calibration(state, symbol_data, symbols):
-    """Full-power startup calibration. Every symbol, every layer, no shortcuts.
-    Called ONCE before the bot places any trade. Periodic run_calibration()
-    continues every 2 hours and on loss triggers - those are lighter (top-K).
-    This is the one time with no time pressure, so we use it fully."""
-    state.trading_locked = True
-    start = time.time()
-    print("=" * 60)
-    print("DEEP STARTUP CALIBRATION — full power, all symbols")
-    print("=" * 60)
-
-    all_confidences = []
-    symbol_reports  = {}
-
+async def subscribe_ticks(client, symbols):
     for s in symbols:
-        sd = symbol_data[s]
-        n  = len(sd.ticks)
-        fam = "1HZ" if "1HZ" in s else "R_ "
-        vlog(f"\n[DeepCal] [{fam}] {s}: {n} ticks  tick_dt={sd.tick_dt:.1f}s — "
-              f"starting {5}-fold expanding walk-forward...")
-
-        if n < MIN_TICKS_FOR_FIT * 2 + 100:
-            vlog(f"[DeepCal] {s}: insufficient history, skipping.")
-            state.reliability[s] = 0.3
-            continue
-
-        # FIX v2: 3 folds + step=5 cuts calibration time from 688s to ~200s
-        # (40% fewer folds × 40% fewer test-window re-fits) with no meaningful
-        # loss of calibration accuracy on 10k-tick synthetic index histories.
-        report = expanding_window_walk_forward(sd, n_folds=3,
-                                               horizons=CANDIDATE_DURATIONS, step=5)
-        if report is None:
-            vlog(f"[DeepCal] {s}: walk-forward returned no result. Not tradeable.")
-            state.reliability[s] = 0.3
-            continue
-
-        stability_warns = check_model_stability(report["best_models"], s)
-
-        vlog(f"[DeepCal] {s}: {report['n_folds_completed']}/3 folds")
-        print(f"  Mean OOS hit rate : {report['mean_hit_rate']:.3f}  (std={report['std_hit_rate']:.3f})")
-        print(f"  Per-fold          : {[f'f{x[0]}={x[3]:.3f}' for x in report['per_fold_hit_rates']]}")
-        print(f"  Per-duration win% : { {d: f'{v:.3f}' for d,v in sorted(report['per_duration_win_rates'].items())} }")
-        print(f"  Layer correlations: { {l: f'{v:+.3f}' for l,v in sorted(report['per_layer_correlations'].items(), key=lambda x: abs(x[1]), reverse=True)} }")
-        vlog(f"  Is tradeable      : {report['is_tradeable']}  (mean hit rate >= 0.46)")
-        if stability_warns:
-            vlog(f"  *** STABILITY WARNINGS ***")
-            for w in stability_warns:
-                print(f"      {w}")
-        else:
-            print(f"  Model stability   : CLEAN")
-
-        if report["best_models"] is not None and report["best_models"].fitted:
-            m = report["best_models"]
-            m.empirical_duration_win_rates = report["per_duration_win_rates"]
-
-            # ── Convert OOS per-layer correlations → fusion weights ────────
-            # Correlation with realized outcome tells us how much each layer
-            # actually predicts direction on THIS specific symbol. We scale
-            # it into a positive weight: perfectly correlated layer gets 2x
-            # its static default, uncorrelated gets 0.1x (not zero — avoids
-            # a layer being silenced on a short OOS window that may be noisy).
-            corr = report["per_layer_correlations"]
-            if corr:
-                learned_w = {}
-                for layer, c in corr.items():
-                    # abs(corr) in [0,1] → weight in [0.1, 2.0]
-                    learned_w[layer] = float(np.clip(0.1 + abs(c) * 1.9, 0.1, 2.0))
-                    # preserve sign: if layer is negatively correlated, flip
-                    # its evidence contribution (handled in bayesian_fusion via
-                    # the weight staying positive but the signal itself carrying
-                    # direction - weight scales magnitude only)
-                m.per_layer_weights = learned_w
-                top3 = sorted(corr.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
-                vlog(f"  Learned weights   : top-3 predictors = "
-                      f"{[(l, f'{c:+.3f}') for l,c in top3]}")
-            else:
-                m.per_layer_weights = None
-                vlog(f"  Learned weights   : insufficient OOS data, using static defaults")
-
-            state.model_cache[s] = m
-
-            # ── Warm-start: blend Supabase-persisted weights ───────────────
-            pending = state._pending_weights.get(s)
-            if pending:
-                if m.per_layer_weights is None:
-                    m.per_layer_weights = pending
-                    print(f"  Warm weights      : restored from Supabase (no OOS weights this run)")
-                else:
-                    all_keys = set(m.per_layer_weights) | set(pending)
-                    m.per_layer_weights = {
-                        k: round(0.7 * m.per_layer_weights.get(k, 1.0)
-                                 + 0.3 * pending.get(k, 1.0), 6)
-                        for k in all_keys
-                    }
-                    print(f"  Warm weights      : blended OOS 70% + Supabase prior 30%")
-
-        state.reliability[s] = float(np.clip(report["mean_hit_rate"] / 0.5, 0.3, 1.5))
-        symbol_reports[s]    = report
-
-        # ── Per-symbol threshold from THIS symbol's OOS confidence distribution
-        # Each symbol gets its own threshold derived from its own OOS confidence
-        # scores, not a pooled global number.
-        # FIX v3: Scale the threshold by the symbol's reliability score.
-        # Previously ALL symbols used ADAPTIVE_THRESHOLD_PERCENTILE=75 regardless
-        # of reliability. A low-reliability symbol (e.g. 0.3-0.6) that produces
-        # naturally noisy confidence scores ended up with a threshold it could
-        # never clear in live trading — confirmed: 6 of 8 symbols showed zero
-        # trades despite showing '8/8 ready' in the heartbeat. Now the percentile
-        # is inversely scaled by reliability: a very reliable symbol (1.2) still
-        # uses the 75th percentile bar; a low-reliability symbol (0.3) uses the
-        # 40th percentile bar — letting it compete at all rather than being
-        # silently frozen out by an impossible threshold.
-        sym_rel = state.reliability.get(s, 1.0)
-        rel_scaled_pct = int(np.clip(
-            ADAPTIVE_THRESHOLD_PERCENTILE * (sym_rel / 1.0),
-            35, ADAPTIVE_THRESHOLD_PERCENTILE
-        ))
-        sym_confidences = report["all_confidences"]
-        if sym_confidences:
-            sym_thr = float(np.clip(
-                np.percentile(sym_confidences, rel_scaled_pct), 0.015, 0.55))
-            pct_clr = float(np.mean(np.array(sym_confidences) >= sym_thr))
-            # Safety valve: if still starved, drop further
-            if pct_clr < 0.10:
-                sym_thr = float(np.percentile(sym_confidences,
-                                              max(rel_scaled_pct - 15, 25)))
-                pct_clr = float(np.mean(np.array(sym_confidences) >= sym_thr))
-            elif pct_clr > 0.60:
-                sym_thr = float(np.percentile(sym_confidences,
-                                              min(rel_scaled_pct + 10, 80)))
-                pct_clr = float(np.mean(np.array(sym_confidences) >= sym_thr))
-            state.per_symbol_threshold[s] = sym_thr
-            vlog(f"  Per-symbol thr    : {sym_thr:.4f}  "
-                  f"({pct_clr*100:.0f}% OOS points clear, "
-                  f"pct={rel_scaled_pct}, rel={sym_rel:.2f})")
-        else:
-            # No OOS confidence data — use a conservative fraction of the global
-            # threshold rather than the full bar which this symbol can't clear
-            state.per_symbol_threshold[s] = state.adaptive_threshold * max(sym_rel, 0.5)
-
-        all_confidences.extend(sym_confidences)
-        vlog(f"  Reliability       : {state.reliability[s]:.3f}")
-
-    if all_confidences:
-        global_thr = float(np.clip(
-            np.percentile(all_confidences, ADAPTIVE_THRESHOLD_PERCENTILE), 0.03, 0.6))
-        state.adaptive_threshold = global_thr   # global fallback only
-        vlog(f"\n[DeepCal] Global fallback threshold -> {global_thr:.4f} "
-              f"(per-symbol thresholds take precedence when set)")
-    else:
-        vlog(f"\n[DeepCal] WARNING: no confidence samples — keeping default "
-              f"threshold={state.adaptive_threshold:.3f}")
-
-    tradeable     = [s for s,r in symbol_reports.items() if r["is_tradeable"]]
-    not_tradeable = [s for s,r in symbol_reports.items() if not r["is_tradeable"]]
-    vlog(f"\n[DeepCal] TRADEABLE ({len(tradeable)}): {tradeable}")
-    vlog(f"[DeepCal] BELOW EDGE BAR ({len(not_tradeable)}): {not_tradeable}")
-    vlog(f"[DeepCal] Below-bar symbols still compete via ensemble — "
-          f"lower reliability multiplier means they need a stronger signal to win selection.")
-
-    elapsed = time.time() - start
-    vlog(f"\n[DeepCal] Complete in {elapsed:.1f}s ({elapsed/60:.1f} min). Bot armed.")
-    print("=" * 60)
-
-    state.last_scheduled_calibration = time.time()
-    state.last_calibration_end       = time.time()
-    state.last_activity              = time.time()
-    state.trading_locked             = False
-
-    # ── v3: Post-calibration snapshots and self-improvement ───────────────
-    for s, report in symbol_reports.items():
-        models = state.model_cache.get(s)
-        if models is None or not models.fitted:
-            continue
-        sd = symbol_data.get(s)
-        if sd is None:
-            continue
-
-        # 1. Drift detector: snapshot training distribution as new reference
-        train_returns = sd.returns()
-        oos_confs     = report.get("all_confidences", [])
-        DriftDetector.snapshot_reference(state, s, train_returns, oos_confs)
-
-        # 2. Confidence calibration: fit temperature + isotonic from OOS data
-        #    Uses the OOS p_up values and actual hit outcomes from walk-forward
-        raw_pups    = report.get("all_p_ups",    [])
-        raw_outcomes= report.get("all_outcomes", [])
-        if len(raw_pups) >= 50 and len(raw_outcomes) >= 50:
-            ConfidenceCalibrator.fit_and_save(
-                state, s,
-                raw_pups[:len(raw_outcomes)],
-                raw_outcomes
-            )
-
-        # 3. Meta-learner: batch retrain from full rolling buffer
-        MetaLearner.retrain_from_buffer(state, s)
-
-    # ── Persist learned state to Supabase ─────────────────────────────────
-    if _store is not None:
-        _store.save_symbol_state(state)
-        _store.save_global_state(state)
-        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
-                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
-    autotune_gates(state)
+        resp = await client.send({"ticks": s, "subscribe": 1})
+        if "error" in resp:
+            print(f"[subscribe] {s}: {resp['error']}")
 
 
-async def run_calibration(state, symbol_data, symbols, trigger_reason):
-    state.trading_locked = True
-    kind, flagged = trigger_reason
-    # FIX v3: flagged is a list for drift triggers, None for scheduled.
-    # Original code did ':' + loss_symbol which crashed when loss_symbol was a list.
-    flagged_str = (','.join(flagged) if isinstance(flagged, list) and flagged
-                   else str(flagged) if flagged else 'all')
-    start = time.time()
-    print(f"[Calibrator] starting (trigger={kind}, symbols={flagged_str}). Trading locked.")
-
-    # Reset drift flags for symbols being recalibrated so they stop
-    # re-triggering recal on every scan cycle with the same stale p-value
-    if isinstance(flagged, list):
-        for s in flagged:
-            state.drift_degraded[s] = False
-            vlog(f"[Calibrator] {s}: drift flag cleared — recalibrating now")
-
-    candidates = symbols   # always recalibrate all symbols
-
-    all_confidences = []
-    symbol_reports  = {}
-
-    for s in candidates:
-        sd = symbol_data[s]
-        if len(sd.ticks) < MIN_TICKS_FOR_FIT + 100:
-            vlog(f"[Calibrator] {s}: not enough ticks yet, skipping.")
-            continue
-
-        # FIX v3: use expanding_window_walk_forward (same as deep_startup_calibration)
-        # run_calibration was calling the old walk_forward_validate which returns a
-        # different signature and doesn't produce all_p_ups/all_outcomes for calibration.
-        report = expanding_window_walk_forward(sd, n_folds=3,
-                                               horizons=CANDIDATE_DURATIONS, step=5)
-        if report is None:
-            vlog(f"[Calibrator] {s}: walk-forward returned no result.")
-            state.reliability[s] = 0.3
-            continue
-
-        models = report["best_models"]
-        if models is not None and models.fitted:
-            pending = state._pending_weights.get(s)
-            if pending:
-                if models.per_layer_weights is None:
-                    models.per_layer_weights = pending
-                else:
-                    all_keys = set(models.per_layer_weights) | set(pending)
-                    models.per_layer_weights = {
-                        k: round(0.7 * models.per_layer_weights.get(k, 1.0)
-                                 + 0.3 * pending.get(k, 1.0), 6)
-                        for k in all_keys
-                    }
-            state.model_cache[s] = models
-
-        hit_rate = report["mean_hit_rate"]
-        state.reliability[s]       = float(np.clip(hit_rate / 0.5, 0.3, 1.5))
-        state.consecutive_losses[s] = 0
-        confidences = report.get("all_confidences", [])
-        all_confidences.extend(confidences)
-        symbol_reports[s] = report
-
-        vlog(f"[Calibrator] {s}: hit_rate={hit_rate:.3f} "
-              f"reliability={state.reliability[s]:.2f} "
-              f"n_conf={len(confidences)}")
-
-    if all_confidences:
-        new_threshold = float(np.percentile(all_confidences, ADAPTIVE_THRESHOLD_PERCENTILE))
-        new_threshold = float(np.clip(new_threshold, 0.03, 0.6))
-        old_threshold = state.adaptive_threshold
-        state.adaptive_threshold = new_threshold
-        pct_clearing = float(np.mean(np.array(all_confidences) >= new_threshold)) * 100
-        vlog(f"[Calibrator] adaptive_threshold {old_threshold:.3f} → {new_threshold:.3f} "
-              f"(~{pct_clearing:.0f}% of OOS points clear it)")
-    else:
-        vlog(f"[Calibrator] no confidence samples — keeping threshold at "
-              f"{state.adaptive_threshold:.3f}")
-
-    # ── v3: Post-calibration self-improvement ─────────────────────────────
-    for s, report in symbol_reports.items():
-        models = state.model_cache.get(s)
-        if models is None or not models.fitted:
-            continue
-        sd = symbol_data.get(s)
-        if sd is None:
-            continue
-        # Drift snapshot reset
-        DriftDetector.snapshot_reference(state, s, sd.returns(),
-                                         report.get("all_confidences", []))
-        # Confidence calibration
-        raw_pups    = report.get("all_p_ups",    [])
-        raw_outcomes= report.get("all_outcomes", [])
-        if len(raw_pups) >= 50 and len(raw_outcomes) >= 50:
-            ConfidenceCalibrator.fit_and_save(state, s,
-                raw_pups[:len(raw_outcomes)], raw_outcomes)
-        # Meta-learner batch retrain
-        MetaLearner.retrain_from_buffer(state, s)
-
-    state.last_scheduled_calibration = time.time()
-    state.last_calibration_end       = time.time()
-    state.last_activity              = time.time()
-    elapsed = time.time() - start
-    print(f"[Calibrator] complete in {elapsed:.1f}s. Symbols updated: {list(symbol_reports.keys())}")
-    state.trading_locked = False
-
-    # ── Persist to Supabase ───────────────────────────────────────────────
-    if _store is not None:
-        _store.save_symbol_state(state)
-        _store.save_global_state(state)
-        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
-                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
-    autotune_gates(state)
-
-
-# ---------------------------------------------------------------------------
-# STREAM CONSUMERS
-# ---------------------------------------------------------------------------
-async def tick_consumer(queue, symbol_data, state):
-    while True:
-        data = await queue.get()
-        tick = data.get("tick")
-        if not tick:
-            continue
-        symbol = tick.get("symbol")
-        if symbol in symbol_data:
-            symbol_data[symbol].add_tick(tick["epoch"], tick["quote"])
-        state.last_activity = time.time()
-
-
-async def balance_consumer(queue, state):
-    while True:
-        data = await queue.get()
-        bal = data.get("balance")
-        if bal:
-            state.balance = bal["balance"]
-
-
-async def watchdog(state):
-    """If WATCHDOG_TIMEOUT seconds pass with no tick received and no main-loop
-    iteration completed (state.last_activity untouched), the process is
-    assumed locked up. Rather than depending on any specific host's restart
-    policy, this re-execs the current Python process in place - identical
-    behavior on Railway and on a local PC, no external supervisor needed."""
-    while True:
-        await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
-        idle = time.time() - state.last_activity
-        if idle > WATCHDOG_TIMEOUT:
-            print(f"[Watchdog] No activity for {idle:.0f}s (limit {WATCHDOG_TIMEOUT}s). "
-                  f"Restarting process in place now.")
-            sys.stdout.flush()
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-
-
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
 async def main():
-    if not DERIV_API_TOKEN:
-        raise RuntimeError("Set the DERIV_API_TOKEN environment variable.")
-    if not DERIV_APP_ID:
-        raise RuntimeError(
-            "Set the DERIV_APP_ID environment variable to your app_id from "
-            "developers.deriv.com. Legacy app_ids (e.g. the old demo id "
-            "1089) do NOT work with the new Options API."
-        )
-    if DERIV_ACCOUNT_TYPE not in ("demo", "real"):
-        raise RuntimeError("DERIV_ACCOUNT_TYPE must be 'demo' or 'real'.")
-    if DERIV_ACCOUNT_TYPE == "real":
-        print("!" * 72)
-        print("! DERIV_ACCOUNT_TYPE=real - this bot will trade with REAL MONEY.    !")
-        print("! Set DERIV_ACCOUNT_TYPE=demo (or unset it) to use a demo account.  !")
-        print("!" * 72)
+    if not DERIV_APP_ID or not DERIV_API_TOKEN:
+        print("ERROR: set DERIV_APP_ID and DERIV_API_TOKEN environment variables.")
+        sys.exit(1)
 
-    client = DerivClient(
-        DERIV_APP_ID, DERIV_API_TOKEN,
-        account_type=DERIV_ACCOUNT_TYPE, account_id=DERIV_ACCOUNT_ID,
-    )
-    account = await client.connect()
-    print(f"Authorized as {account.get('loginid')}")
+    client = DerivClient(DERIV_APP_ID, DERIV_API_TOKEN, DERIV_ACCOUNT_TYPE, DERIV_ACCOUNT_ID)
 
-    state = TradeState()
-    state.balance = account.get("balance", 0.0)
-    print(f"Starting balance: {state.balance}")
+    async def resubscribe(c):
+        await subscribe_ticks(c, SYMBOLS)
 
-    # ── Supabase: init store and warm-start from persisted state ──────────
-    global _store, MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE
-    _store = SupabaseStore()
-    _store.load_symbol_state(state)
-    _store.load_global_state(state)   # FIX v2: restore direction_history
-    gates = _store.load_gates()
-    if gates:
-        MIN_LAYER_AGREE    = int(gates.get("min_layer_agree",    MIN_LAYER_AGREE))
-        MAX_LAYER_DISAGREE = int(gates.get("max_layer_disagree", MAX_LAYER_DISAGREE))
-        MIN_EXP_WIN_RATE   = float(gates.get("min_exp_win_rate", MIN_EXP_WIN_RATE))
-        state.adaptive_threshold = float(gates.get("adaptive_threshold", state.adaptive_threshold))
-        print(f"[Store] Restored gates: agree>={MIN_LAYER_AGREE} "
-              f"disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f} "
-              f"thr={state.adaptive_threshold:.4f}")
+    client.resubscribe_cb = resubscribe
+    await client.connect()
+    await subscribe_ticks(client, SYMBOLS)
 
-    # --- R_ symbols ---
-    r_symbols = []
-    for attempt in range(1, 6):
-        r_symbols = await fetch_tradable_symbols(client)
-        if r_symbols:
-            break
-        print(f"[main] No R_ symbols on attempt {attempt}/5, retrying in 3s...")
-        await asyncio.sleep(3)
-    if not r_symbols:
-        raise RuntimeError("No R_ rise/fall symbols found (check API credentials/connectivity).")
+    candles = {s: SymbolCandles(s) for s in SYMBOLS}
+    asyncio.create_task(tick_consumer(client, candles))
 
-    # --- top-3 1HZ symbols by tick consistency ---
-    hz_symbols = []
-    for attempt in range(1, 4):
-        hz_symbols = await select_top_1hz(client, n_top=3)
-        if hz_symbols:
-            break
-        print(f"[main] No 1HZ symbols on attempt {attempt}/3, retrying in 3s...")
-        await asyncio.sleep(3)
-    if not hz_symbols:
-        print("[main] WARNING: no 1HZ symbols available - proceeding with R_ only.")
+    money = MoneyState()
+    last_trade_time = {s: 0.0 for s in SYMBOLS}
 
-    symbols = r_symbols + hz_symbols
-    print(f"\nFull tradable universe ({len(symbols)} symbols):")
-    print(f"  R_ ({len(r_symbols)}): {r_symbols}")
-    print(f"  1HZ top-3 ({len(hz_symbols)}): {hz_symbols}")
-
-    # build SymbolData with correct tick_dt per family
-    symbol_data = {}
-    for s in r_symbols:
-        symbol_data[s] = SymbolData(s, tick_dt=2.0)   # R_ tick ~every 2s
-    for s in hz_symbols:
-        symbol_data[s] = SymbolData(s, tick_dt=1.0)   # 1HZ ticks every 1s
-
-    print(f"Bootstrapping tick history for all symbols (target: {HISTORY_BOOTSTRAP_COUNT} ticks each)...")
-    for s in symbols:
-        history = await fetch_history(client, s)
-        for epoch, price in history:
-            symbol_data[s].add_tick(epoch, price)
-        actual_dt = symbol_data[s].mean_tick_dt()
-        n = len(symbol_data[s].ticks)
-        span_hrs = (n * actual_dt) / 3600
-        print(f"  {s}: {n} ticks loaded  actual_mean_dt={actual_dt:.2f}s  span≈{span_hrs:.1f}h")
-
-    tick_queue = client.subscribe_channel("tick")
-    balance_queue = client.subscribe_channel("balance")
-
-    async def subscribe_all(c):
-        """Replays balance + per-symbol tick subscriptions. Used for the
-        initial subscribe and re-run as `resubscribe_cb` after every
-        reconnect (a fresh OTP session has no memory of prior subscriptions)."""
-        await c.send({"balance": 1, "subscribe": 1})
-        for s in symbols:
-            await c.send({"ticks": s, "subscribe": 1})
-
-    client.resubscribe_cb = subscribe_all
-    await subscribe_all(client)
-
-    asyncio.create_task(tick_consumer(tick_queue, symbol_data, state))
-    asyncio.create_task(balance_consumer(balance_queue, state))
-    asyncio.create_task(watchdog(state))
-
-    print("Running initial full-power calibration across the entire universe before trading begins...")
-    await deep_startup_calibration(state, symbol_data, symbols)
-
-    print("Bot running. Entering main decision loop.")
-    last_heartbeat = 0.0
+    print(f"Auto-Trading Started — Target Profit ${TARGET_PROFIT} / Stop Loss ${STOP_LOSS} / "
+          f"First Stake ${FIRST_STAKE} / Martingale x{MARTINGALE_FACTOR} up to {MARTINGALE_LEVEL} steps")
+    print(f"Symbols: {SYMBOLS}  |  MC target confidence: {MC_TARGET_PROB:.0%}")
 
     while True:
         await asyncio.sleep(2)
-        state.last_activity = time.time()
 
-        if state.trading_locked or state.trade_in_progress:
-            continue
+        stop_reason = money.should_stop()
+        if stop_reason:
+            print(f"[STOP] {stop_reason} reached. Total profit: {money.total_profit:.2f} "
+                  f"(W:{money.win_count} L:{money.loss_count})")
+            return
 
-        trigger = check_calibration_triggers(state)
-        if trigger:
-            await run_calibration(state, symbol_data, symbols, trigger)
-            continue
-
-        ready_symbols = [s for s in symbols
-                         if s in state.model_cache
-                         and len(symbol_data[s].ticks) >= MIN_TICKS_LIVE]
-
-        now = time.time()
-        if now - last_heartbeat > 30:
-            rec = (f" | RECOVERY step={state.recovery_step} stake={state.recovery_stake:.2f}"
-                   if state.recovery_step > 0 else "")
-            s0_parts = []
-            for sym in ready_symbols:
-                tot = state.step0_total[sym]
-                if tot > 0:
-                    wr = state.step0_wins[sym] / tot
-                    s0_parts.append(f"{sym}:{wr:.0%}({tot})")
-            s0_str = " s0_wr=[" + " ".join(s0_parts) + "]" if s0_parts else ""
-            print(f"[scan] balance={state.balance:.2f} | "
-                  f"{len(ready_symbols)}/{len(symbols)} ready{rec}{s0_str}")
-            last_heartbeat = now
-            # FIX v3: persist direction_history every heartbeat cycle so the
-            # bias-correction window survives Railway restarts reliably rather
-            # than only being saved when a trade closes (which gave only 3
-            # entries in the global_state table after a full session).
-            if _store is not None and len(state.direction_history) > 0:
-                _store.save_global_state(state)
-
-        if not ready_symbols:
-            continue
-
-        returns_window_dict = {s: symbol_data[s].returns()[-200:] for s in ready_symbols}
-
-        # ── RECOVERY MODE ────────────────────────────────────────────────────
-        # No symbol, direction, or duration lock. Recovery is a fresh open scan
-        # at the elevated martingale stake, using models freshly fitted by the
-        # deep recal that fired immediately after the step=0 loss. The best
-        # signal from ANY symbol in ANY direction wins selection — same quality
-        # gates apply (layer agreement, MC win rate, score gap, threshold).
-        if state.recovery_step > 0:
-            # ── v3b: Recovery timeout ────────────────────────────────────────
-            # If no qualifying signal has been found for RECOVERY_ABANDON_AFTER
-            # seconds, write off the sequence rather than holding a large stake
-            # in limbo indefinitely. 20+ min of $164 at risk with no signal is
-            # worse than accepting the loss and resetting cleanly.
-            time_in_recovery = time.time() - getattr(state, 'recovery_start_time', time.time())
-            if time_in_recovery > RECOVERY_ABANDON_AFTER:
-                print(f"[Recovery] TIMEOUT after {time_in_recovery/60:.1f}min — "
-                      f"abandoning step={state.recovery_step} stake={state.recovery_stake:.2f}. "
-                      f"Resetting to normal scan.")
-                clear_recovery(state)
-                state.last_activity = time.time()
+        for symbol in SYMBOLS:
+            sc = candles[symbol]
+            if time.time() - last_trade_time[symbol] < TRADE_COOLDOWN_SEC:
+                continue
+            regime = read_regime(sc)
+            if regime is None:
                 continue
 
-            # ── Recovery signal selection ─────────────────────────────────
-            # ROOT CAUSE FIX: the previous code used select_trade() which
-            # applies per-symbol confidence thresholds derived from OOS
-            # calibration (typically 0.05-0.15). Live signal confidence scores
-            # are 0.013-0.018 — always below those thresholds — so select_trade
-            # returned None every single time, causing recovery to spin forever
-            # for hours without ever finding a signal.
-            #
-            # Recovery selection is now a direct best-signal picker:
-            # evaluate all symbols, apply only the LAYER GATE (hard quality
-            # check), and pick the one with the strongest layer agreement.
-            # No per-symbol confidence threshold — recovery just needs the
-            # best available signal that the model agrees on directionally.
-            rec_candidates = []
-            for s in ready_symbols:
-                sd    = symbol_data[s]
-                feats = compute_features(sd, state.model_cache.get(s), returns_window_dict)
-                if feats is None:
+            stake = max(MIN_STAKE, money.stake)
+
+            if regime.trending and regime.cross_down_confirmed and regime.black_candle:
+                # Mirrors the original bot's exact entry trigger.
+                trend_is_bullish = regime.ema_fast_prev > regime.ema_slow_prev  # was uptrend, now confirmed reversal down
+                best = await select_best_notouch(client, symbol, sc, trend_is_bullish, stake)
+                if best is None or best["ev"] <= 0:
                     continue
-                p_up, confidence = fuse_signal(feats, state, s)
-                direction = 1 if p_up > 0.5 else -1
-                # Recovery uses a relaxed layer gate (8/5 vs 10/3 for step-0).
-                # We just need the best available directional signal to close
-                # the open sequence — not the same high bar as a fresh entry.
-                n_layers     = feats.get('n_layers', 17)
-                if direction == 1:
-                    n_agree_s    = feats.get('agree_up', 0)
-                    n_disagree_s = feats.get('disagree_up', 0)
-                else:
-                    n_agree_s    = feats.get('disagree_up', 0)
-                    n_disagree_s = feats.get('agree_up', 0)
-                if n_agree_s < 8 or n_disagree_s > 5:
+                print(f"[NOTOUCH] {symbol} dur={best['duration']}m barrier={best['barrier_price']} "
+                      f"p={best['p_no_touch']:.2f} payout_ratio={best['payout_ratio']} ev={best['ev']}")
+                contract_id = await buy_from_proposal(client, best["proposal_id"], stake)
+                won, profit = await wait_for_contract_result(client, contract_id)
+
+            elif not regime.trending:
+                best = await select_best_expiryrange(client, symbol, sc, stake)
+                if best is None or best["ev"] <= 0:
                     continue
-                nt = await select_notouch_trade(
-                    client, s, sd.prices(), sd.returns(), direction, feats,
-                    state.recovery_stake, tick_dt=getattr(sd, "tick_dt", 1.0),
-                    models=state.model_cache.get(s)
-                )
-                if nt is None or nt["ev"] <= 0:
-                    continue
-                duration_s, exp_win = nt["duration"], nt["p_no_touch"]
-                # Score by layer agreement × reliability
-                score = n_agree_s * state.reliability.get(s, 1.0)
-                rec_candidates.append((score, s, direction, p_up, confidence,
-                                       duration_s, exp_win, feats, n_agree_s, nt))
+                print(f"[EXPIRYRANGE] {symbol} dur={best['duration']}m "
+                      f"range=[{best['barrier_low']}, {best['barrier_high']}] "
+                      f"p={best['p_in_range']:.2f} payout_ratio={best['payout_ratio']} ev={best['ev']}")
+                contract_id = await buy_from_proposal(client, best["proposal_id"], stake)
+                won, profit = await wait_for_contract_result(client, contract_id)
 
-            if not rec_candidates:
-                vlog(f"[Recovery] No qualifying signal this cycle — still waiting")
-                await asyncio.sleep(2)
-                continue
-
-            # Pick the strongest
-            rec_candidates.sort(reverse=True)
-            _, rec_sym, rec_dir, rec_p_up, rec_conf, duration, exp_win_rate, feats, n_agree, rec_nt = rec_candidates[0]
-            rec_score = rec_conf * state.reliability.get(rec_sym, 1.0)
-
-            explain_signal(
-                symbol=rec_sym, direction=rec_dir,
-                feats=feats, p_up=rec_p_up, confidence=rec_conf,
-                duration=duration, exp_win=exp_win_rate, score=rec_score
-            )
-            vlog(f"[Recovery/NOTOUCH] {rec_sym} barrier={rec_nt['barrier_price']:.2f} "
-                 f"({rec_nt['side']}) dur={duration}{rec_nt['duration_unit']} "
-                 f"p_no_touch={rec_nt['p_no_touch']:.2f} payout_ratio={rec_nt['payout_ratio']:.2f} "
-                 f"ev={rec_nt['ev']:.2f}")
-
-            # Final atomic gate re-check inside execute_single_step is the
-            # last line of defence — passes feats and direction through.
-            won, _ = await execute_single_step(
-                client, state, rec_sym, rec_dir,
-                state.recovery_stake, state.recovery_step,
-                duration=duration, feats=feats,
-                barrier=rec_nt["barrier_price"], duration_unit=rec_nt["duration_unit"]
-            )
-
-            if won:
-                print(f"[Recovery] Recovered at step={state.recovery_step} "
-                      f"via {rec_sym} {'CALL' if rec_dir>0 else 'PUT'}.")
-                state.consecutive_losses[rec_sym] = 0
-                emit_sequence_summary(state, rec_sym, rec_dir, True)
-                clear_recovery(state)
             else:
-                next_step  = state.recovery_step + 1
-                next_stake = round(state.recovery_stake * MARTINGALE_FACTOR, 2)
-                if next_step > MARTINGALE_MAX_STEPS:
-                    print(f"[Recovery] Exhausted all {MARTINGALE_MAX_STEPS} steps — "
-                          f"closing sequence and running deep recalibration.")
-                    state.consecutive_losses[rec_sym] += 1
-                    emit_sequence_summary(state, rec_sym, rec_dir, False)
-                    clear_recovery(state)
-                    await deep_startup_calibration(state, symbol_data, symbols)
-                else:
-                    # FIX v2: Sequence loss guard — abort if cumulative risk
-                    # would exceed MAX_SEQUENCE_LOSS_PCT of current balance.
-                    state.seq_stakes_committed += state.recovery_stake
-                    max_allowed = state.balance * MAX_SEQUENCE_LOSS_PCT
-                    if state.seq_stakes_committed + next_stake > max_allowed:
-                        print(f"[Recovery] SEQUENCE LOSS GUARD triggered — "
-                              f"committed={state.seq_stakes_committed:.2f} "
-                              f"next={next_stake:.2f} > max={max_allowed:.2f}. "
-                              f"Aborting sequence to protect balance.")
-                        emit_sequence_summary(state, rec_sym, rec_dir, False)
-                        clear_recovery(state)
-                        state.seq_stakes_committed = 0.0
-                    else:
-                        state.recovery_step  = next_step
-                        state.recovery_stake = next_stake
-                        print(f"[Recovery] step={state.recovery_step - 1} lost on {rec_sym} — "
-                              f"next step={next_step} stake={next_stake:.2f}")
-                        # FIX v2: POST_LOSS_DEEP_RECAL is now False — no 688s
-                        # calibration pause after each recovery step. The scheduled
-                        # 2-hour recal is sufficient for model freshness.
-                        if POST_LOSS_DEEP_RECAL:
-                            await deep_startup_calibration(state, symbol_data, symbols)
-
-            state.last_activity = time.time()
-            continue
-
-        # ── NORMAL ENTRY ─────────────────────────────────────────────────────
-        # FIX v2: Compute direction balance ratio from recent trade history.
-        # Passed into feats so bayesian_fusion can apply a soft correction
-        # when one direction is systematically over-represented.
-        recent_dirs = state.direction_history[-30:] if state.direction_history else []
-        if recent_dirs:
-            recent_call_ratio = sum(1 for d in recent_dirs if d == 1) / len(recent_dirs)
-        else:
-            recent_call_ratio = 0.5
-
-        # ── v3: Portfolio scan — evaluate ALL ready symbols simultaneously ─
-        # Build a candidate list of signals that pass all quality gates.
-        # PortfolioAllocator then assigns stakes across them by edge × confidence
-        # × correlation adjustment rather than picking just one winner.
-        # ── v3b: Trade cooldown ──────────────────────────────────────────────
-        # Prevents back-to-back entries within seconds of each other.
-        # Each step-0 trade requires an independent market state — firing
-        # immediately after the previous contract resolves is guesswork.
-        time_since_last = time.time() - state.last_step0_time
-        if time_since_last < MIN_TRADE_COOLDOWN:
-            remaining = int(MIN_TRADE_COOLDOWN - time_since_last)
-            vlog(f"[Cooldown] {remaining}s until next entry eligible")
-            await asyncio.sleep(2)
-            continue
-
-        portfolio_candidates = []
-
-        for s in ready_symbols:
-            # Skip symbols already holding an open position
-            if s in state.open_positions:
                 continue
 
-            sd    = symbol_data[s]
-            feats = compute_features(sd, state.model_cache.get(s), returns_window_dict)
-            if feats is None:
-                continue
-            feats["recent_call_ratio"] = recent_call_ratio
-
-            # v3: Run drift check on live signal (KS + PSI)
-            live_returns = sd.returns()
-            p_up, confidence = fuse_signal(feats, state, s)
-            DriftDetector.check_all(state, s, live_returns, float(confidence))
-
-            direction = 1 if p_up > 0.5 else -1
-
-            # MC barrier/duration selection, confirmed against a live quote.
-            # Quoted at the floor stake since NOTOUCH payout_ratio is
-            # stake-invariant (Deriv prices it as a ratio) — the real stake
-            # is decided afterwards by the portfolio allocator.
-            quote_stake = calculate_stake(state.balance)
-            nt = await select_notouch_trade(
-                client, s, sd.prices(), live_returns, direction, feats,
-                quote_stake, tick_dt=getattr(sd, "tick_dt", 1.0),
-                models=state.model_cache.get(s)
-            )
-            if nt is None or nt["ev"] <= 0:
-                continue
-            duration, exp_win_rate = nt["duration"], nt["p_no_touch"]
-
-            # Gate 1: Layer agreement
-            gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats, direction)
-            if not gate_ok:
-                vlog(f"[Gate] {s} skipped — layer vote {n_agree} agree / "
-                      f"{n_disagree} disagree / {n_neutral} neutral "
-                      f"(need >={MIN_LAYER_AGREE} agree, <={MAX_LAYER_DISAGREE} disagree)")
-                continue
-
-            # Gate 2: Permutation entropy
-            pe_ok, pe_score = entropy_gate_passes(sd.prices())
-            if not pe_ok:
-                vlog(f"[EntropyGate] {s} skipped — PE={pe_score:.3f} >= {PE_THRESHOLD}")
-                continue
-
-            # Gate 3: Multi-timeframe confluence
-            tf_agree, tf_dirs = multi_timeframe_confluence(sd.prices(), direction)
-            if tf_agree < MIN_TF_AGREEMENT:
-                vlog(f"[Confluence] {s} skipped — only {tf_agree}/3 TFs agree {tf_dirs}")
-                continue
-
-            # Bootstrap gate removed from step-0 path — redundant.
-            # The layer gate (9/4), entropy gate (PE<0.85), and confluence
-            # (2/3 TFs) already provide three independent quality filters.
-            # Bootstrap MC was cutting ~50% of what survived those three,
-            # adding compute cost for marginal quality gain given that the
-            # parametric and model-free estimates both hover near 0.50-0.55
-            # on synthetic random walks — systematic disagreement is the norm,
-            # not evidence of a bad signal. Kept in the codebase for recovery
-            # path where it remains a useful secondary check.
-
-            # Passed all gates — add to portfolio candidates
-            portfolio_candidates.append(
-                (s, direction, float(p_up), float(confidence), float(exp_win_rate), int(duration), nt)
-            )
-
-        if not portfolio_candidates:
-            continue
-
-        # Sort by confidence × reliability descending so allocator processes
-        # strongest signals first (correlation penalty uses insertion order)
-        portfolio_candidates.sort(
-            key=lambda c: c[3] * state.reliability.get(c[0], 1.0),
-            reverse=True
-        )
-
-        # ── v3: Portfolio allocation ───────────────────────────────────────
-        allocations = PortfolioAllocator.allocate(
-            portfolio_candidates, state, symbol_data, state.balance
-        )
-        if not allocations:
-            continue
-
-        # Execute each allocation — fire trades simultaneously
-        for symbol, direction, base_stake, duration, barrier_price, duration_unit in allocations:
-            sd    = symbol_data[symbol]
-            feats = compute_features(sd, state.model_cache.get(symbol), returns_window_dict)
-            if feats is None:
-                continue
-
-            # Recover p_up and confidence for the selected symbol
-            p_up_sym = next((c[2] for c in portfolio_candidates if c[0] == symbol), 0.5)
-            conf_sym  = next((c[3] for c in portfolio_candidates if c[0] == symbol), 0.0)
-            score_sym = conf_sym * state.reliability.get(symbol, 1.0)
-
-            reset_sequence_accumulator(state, state.balance, p_up_sym, conf_sym, duration)
-            state.last_step0_time = time.time()   # v3b: cooldown tracking
-
-            explain_signal(
-                symbol=symbol, direction=direction,
-                feats=feats, p_up=p_up_sym, confidence=conf_sym,
-                duration=duration, exp_win=next(
-                    (c[4] for c in portfolio_candidates if c[0] == symbol), 0.5),
-                score=score_sym
-            )
-            if barrier_price is not None:
-                vlog(f"[NOTOUCH] {symbol} barrier={barrier_price:.2f} "
-                     f"dur={duration}{duration_unit}")
-
-            # Track in open_positions for portfolio allocator deduplication
-            state.open_positions[symbol] = {
-                "direction": direction,
-                "stake":     base_stake,
-                "open_time": time.time(),
-            }
-
-            won, _ = await execute_single_step(
-                client, state, symbol, direction, base_stake, 0,
-                duration=duration, feats=feats,
-                barrier=barrier_price, duration_unit=duration_unit
-            )
-
-            # Remove from open positions after resolution
-            state.open_positions.pop(symbol, None)
-
+            last_trade_time[symbol] = time.time()
             if won:
-                # Clean win — record and reset sequence for this symbol
-                state.consecutive_losses[symbol] = 0
-                emit_sequence_summary(state, symbol, direction, True)
+                money.on_win(profit)
+                print(f"[WIN] {symbol} profit={profit:.2f} total={money.total_profit:.2f}")
             else:
-                next_stake = round(base_stake * MARTINGALE_FACTOR, 2)
-                cumulative = base_stake
-                max_allowed = state.balance * MAX_SEQUENCE_LOSS_PCT
-                if MARTINGALE_MAX_STEPS >= 1 and cumulative + next_stake <= max_allowed:
-                    state.recovery_step           = 1
-                    state.recovery_stake          = next_stake
-                    state.seq_stakes_committed    = cumulative
-                    state.recovery_start_time     = time.time()
-                    print(f"[Recovery] {symbol} step=0 loss — "
-                          f"recovery step=1 stake={next_stake:.2f} "
-                          f"(will abandon after {RECOVERY_ABANDON_AFTER//60}min if no signal)")
-                else:
-                    # Sequence loss guard or martingale disabled
-                    state.consecutive_losses[symbol] += 1
-                    emit_sequence_summary(state, symbol, direction, False)
-
-        # Portfolio fires all allocations above, then waits for the next
-        # main-loop scan cycle before re-evaluating symbols.
-        state.last_activity = time.time()
+                money.on_loss(profit)
+                print(f"[LOSS] {symbol} profit={profit:.2f} total={money.total_profit:.2f} "
+                      f"next_stake={money.stake}")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        raise
-    except Exception as e:
-        print(f"[main] Unhandled exception, restarting process in place: {type(e).__name__}: {e}")
-        sys.stdout.flush()
-        time.sleep(3)  # brief pause so a fast crash loop doesn't hammer the API
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        pass
