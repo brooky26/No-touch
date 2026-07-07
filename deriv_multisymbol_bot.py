@@ -129,8 +129,29 @@ NOTOUCH_MIN_MINUTES     = 3       # "more than 2 minutes"
 EXPIRYRANGE_DURATIONS   = [2, 3, 5, 7, 10, 15]
 NOTOUCH_DURATIONS       = [3, 5, 7, 10, 15, 20, 30]
 
+# ── Daily Reset Indices (RDBEAR/RDBULL) special handling ──────────────────
+# These reset to a base of 1000 at 00:00 GMT every day and trend within the
+# 24h window rather than random-walking around zero - Deriv itself advises
+# against entering trades right at the rollover. Two adjustments follow:
+#   1. Skip trading inside a blackout window around the reset.
+#   2. Feed the Monte Carlo a real drift estimate instead of assuming
+#      zero-mean returns (a pure random-walk assumption underprices barrier
+#      touch/miss risk on a trending instrument).
+DAILY_RESET_SYMBOLS   = {"RDBEAR", "RDBULL"}
+RESET_BLACKOUT_MINUTES = 10          # no new trades within this window of 00:00 GMT
+DRIFT_LOOKBACK_TICKS   = 300          # window used to estimate per-tick drift
+
 TRADE_COOLDOWN_SEC = 30           # avoid re-entering on every single new candle
 CANDIDATE_TOP_K     = 6           # how many MC candidates get a live quote check
+
+# Set VERBOSE_LOGS=1 in Railway's env vars to see per-cycle diagnostics:
+# warm-up progress, regime reads, and why each candidate was skipped.
+# Default (0) stays quiet and only prints startup, trades, wins/losses.
+VERBOSE_LOGS = os.getenv("VERBOSE_LOGS", "0").strip() == "1"
+
+def vlog(*args, **kwargs):
+    if VERBOSE_LOGS:
+        print(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -454,14 +475,59 @@ def read_regime(sc: SymbolCandles) -> Optional[RegimeRead]:
 # ---------------------------------------------------------------------------
 # MONTE CARLO - DURATION + BARRIER SELECTION
 # ---------------------------------------------------------------------------
-def _simulate_paths(vol_per_tick, n_ticks, n_sims=MC_SIMULATIONS):
+def _simulate_paths(vol_per_tick, n_ticks, n_sims=MC_SIMULATIONS, drift_per_tick=0.0):
     """Simulates n_sims GBM-style log-return paths of n_ticks steps.
+    drift_per_tick lets trending instruments (RDBEAR/RDBULL) be simulated
+    with their real intraday drift instead of assuming a pure random walk.
     Returns (cum_log, running_max, running_min) arrays of shape (n_sims, n_ticks)."""
-    steps = np.random.normal(0.0, vol_per_tick, size=(n_sims, n_ticks))
+    steps = np.random.normal(drift_per_tick, vol_per_tick, size=(n_sims, n_ticks))
     cum_log = np.cumsum(steps, axis=1)
     running_max = np.maximum.accumulate(cum_log, axis=1)
     running_min = np.minimum.accumulate(cum_log, axis=1)
     return cum_log, running_max, running_min
+
+
+def _tick_drift(returns, symbol):
+    """Per-tick drift estimate. Zero for ordinary random-walk symbols
+    (matches the original assumption) - only estimated for the Daily
+    Reset indices, where a real intraday trend exists and ignoring it
+    would misprice barrier/range probabilities."""
+    if symbol not in DAILY_RESET_SYMBOLS:
+        return 0.0
+    if len(returns) < 20:
+        return 0.0
+    window = returns[-DRIFT_LOOKBACK_TICKS:] if len(returns) >= DRIFT_LOOKBACK_TICKS else returns
+    return float(np.mean(window))
+
+
+def seconds_until_next_reset():
+    """Seconds until the next 00:00:00 GMT reset."""
+    now = time.gmtime()
+    seconds_today = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
+    return 86400 - seconds_today
+
+
+def in_reset_blackout(symbol):
+    """True if `symbol` is a Daily Reset index and we're within the
+    blackout window either side of the 00:00 GMT rollover."""
+    if symbol not in DAILY_RESET_SYMBOLS:
+        return False
+    secs_to_reset = seconds_until_next_reset()
+    blackout = RESET_BLACKOUT_MINUTES * 60
+    # within window BEFORE reset, or within window AFTER (i.e. just ticked over)
+    return secs_to_reset <= blackout or secs_to_reset >= (86400 - blackout)
+
+
+def filter_durations_before_reset(symbol, candidate_minutes):
+    """Drops any candidate duration that would still be open when the
+    next reset hits - a contract spanning the rollover on a trending
+    instrument isn't priced by our (or the live proposal's) model
+    assumptions the same way."""
+    if symbol not in DAILY_RESET_SYMBOLS:
+        return candidate_minutes
+    secs_to_reset = seconds_until_next_reset()
+    safe_minutes = (secs_to_reset - RESET_BLACKOUT_MINUTES * 60) / 60.0
+    return [m for m in candidate_minutes if m < safe_minutes]
 
 
 def _tick_vol(returns):
@@ -477,18 +543,25 @@ def mc_select_notouch(sc: SymbolCandles, trend_is_bullish: bool):
     (bullish trend -> barrier below current price; bearish -> above),
     mirroring the original bot's directional bias. Grid-searches
     (duration, sigma) for the combo whose simulated P(no_touch) is
-    closest to MC_TARGET_PROB, for each candidate duration."""
+    closest to MC_TARGET_PROB, for each candidate duration.
+
+    For RDBEAR/RDBULL, candidate durations that would still be open at
+    the next 00:00 GMT reset are dropped, and the simulated paths use the
+    instrument's real recent drift instead of a zero-mean random walk."""
     returns = sc.returns()
     vol = _tick_vol(returns)
     if vol is None:
         return []
     mean_dt = _mean_tick_dt(sc)
     price = sc.prices()[-1]
+    drift = _tick_drift(returns, sc.symbol)
+
+    duration_grid = filter_durations_before_reset(sc.symbol, NOTOUCH_DURATIONS)
 
     candidates = []
-    for minutes in NOTOUCH_DURATIONS:
+    for minutes in duration_grid:
         n_ticks = max(5, int(round(minutes * 60.0 / mean_dt)))
-        cum_log, running_max, running_min = _simulate_paths(vol, n_ticks)
+        cum_log, running_max, running_min = _simulate_paths(vol, n_ticks, drift_per_tick=drift)
         best_for_duration = None
         for sigma_k in MC_SIGMA_GRID:
             scaled_vol = vol * np.sqrt(n_ticks)
@@ -520,20 +593,27 @@ def mc_select_expiryrange(sc: SymbolCandles):
     """Terminal-value-only MC (ends-in-range doesn't care what the path
     touched along the way, only where it finishes): for each candidate
     duration, picks the symmetric barrier width whose simulated
-    P(ends inside range) is closest to MC_TARGET_PROB."""
+    P(ends inside range) is closest to MC_TARGET_PROB.
+
+    Same RDBEAR/RDBULL adjustments as mc_select_notouch: reset-aware
+    duration filtering and drift-aware simulation."""
     returns = sc.returns()
     vol = _tick_vol(returns)
     if vol is None:
         return []
     mean_dt = _mean_tick_dt(sc)
     price = sc.prices()[-1]
+    drift = _tick_drift(returns, sc.symbol)
+
+    duration_grid = filter_durations_before_reset(sc.symbol, EXPIRYRANGE_DURATIONS)
 
     candidates = []
-    for minutes in EXPIRYRANGE_DURATIONS:
+    for minutes in duration_grid:
         n_ticks = max(5, int(round(minutes * 60.0 / mean_dt)))
         scaled_vol = vol * np.sqrt(n_ticks)
+        drift_total = drift * n_ticks
         # Simulate only the terminal value - much cheaper than full paths.
-        terminal = np.random.normal(0.0, scaled_vol, size=MC_SIMULATIONS)
+        terminal = np.random.normal(drift_total, scaled_vol, size=MC_SIMULATIONS)
         best_for_duration = None
         for sigma_k in MC_SIGMA_GRID:
             log_dist = sigma_k * scaled_vol
@@ -746,11 +826,27 @@ async def main():
 
         for symbol in SYMBOLS:
             sc = candles[symbol]
+
+            if not sc.ready():
+                vlog(f"[{symbol}] warming up: {len(sc.candles)}/{EMA_SLOW + 2} candles, "
+                     f"{len(sc.ticks)}/100 ticks")
+                continue
+
+            if in_reset_blackout(symbol):
+                vlog(f"[{symbol}] in daily-reset blackout window "
+                     f"(+/-{RESET_BLACKOUT_MINUTES}min of 00:00 GMT) — skipping")
+                continue
+
             if time.time() - last_trade_time[symbol] < TRADE_COOLDOWN_SEC:
                 continue
+
             regime = read_regime(sc)
             if regime is None:
                 continue
+
+            vlog(f"[{symbol}] regime: trending={regime.trending} adx={regime.adx} "
+                 f"ema7={regime.ema_fast:.4f} ema14={regime.ema_slow:.4f} "
+                 f"cross_down={regime.cross_down_confirmed} black={regime.black_candle}")
 
             stake = max(MIN_STAKE, money.stake)
 
@@ -758,7 +854,13 @@ async def main():
                 # Mirrors the original bot's exact entry trigger.
                 trend_is_bullish = regime.ema_fast_prev > regime.ema_slow_prev  # was uptrend, now confirmed reversal down
                 best = await select_best_notouch(client, symbol, sc, trend_is_bullish, stake)
-                if best is None or best["ev"] <= 0:
+                if best is None:
+                    vlog(f"[{symbol}] NOTOUCH: no candidate cleared a live quote")
+                    continue
+                if best["ev"] <= 0:
+                    vlog(f"[{symbol}] NOTOUCH: best candidate ev={best['ev']} <= 0, skipping "
+                         f"(dur={best['duration']}m barrier={best['barrier_price']} "
+                         f"p={best['p_no_touch']:.2f} payout_ratio={best['payout_ratio']})")
                     continue
                 print(f"[NOTOUCH] {symbol} dur={best['duration']}m barrier={best['barrier_price']} "
                       f"p={best['p_no_touch']:.2f} payout_ratio={best['payout_ratio']} ev={best['ev']}")
@@ -767,7 +869,13 @@ async def main():
 
             elif not regime.trending:
                 best = await select_best_expiryrange(client, symbol, sc, stake)
-                if best is None or best["ev"] <= 0:
+                if best is None:
+                    vlog(f"[{symbol}] EXPIRYRANGE: no candidate cleared a live quote")
+                    continue
+                if best["ev"] <= 0:
+                    vlog(f"[{symbol}] EXPIRYRANGE: best candidate ev={best['ev']} <= 0, skipping "
+                         f"(dur={best['duration']}m range=[{best['barrier_low']},{best['barrier_high']}] "
+                         f"p={best['p_in_range']:.2f} payout_ratio={best['payout_ratio']})")
                     continue
                 print(f"[EXPIRYRANGE] {symbol} dur={best['duration']}m "
                       f"range=[{best['barrier_low']}, {best['barrier_high']}] "
@@ -776,6 +884,7 @@ async def main():
                 won, profit = await wait_for_contract_result(client, contract_id)
 
             else:
+                vlog(f"[{symbol}] trending but no confirmed cross-down/black-candle signal — waiting")
                 continue
 
             last_trade_time[symbol] = time.time()
