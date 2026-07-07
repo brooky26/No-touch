@@ -3051,11 +3051,11 @@ def meta_ensemble_agrees(returns, direction, duration, parametric_p,
 # everything is converted to an equivalent tick count internally using the
 # symbol's tick_dt (seconds/tick) before simulating — the human-readable
 # duration + unit is preserved separately for the actual Deriv API call.
-NOTOUCH_TICK_DURATIONS   = list(range(5, 11))                       # 5..10 ticks
-NOTOUCH_MINUTE_DURATIONS = [2, 3, 5, 10, 15, 20, 30, 45, 60]        # minutes, all symbols
-NOTOUCH_BARRIER_SIGMAS   = [0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0]
+NOTOUCH_TICK_DURATIONS   = [5, 7, 10]                 # trimmed from 5-10 — 3 representative points
+NOTOUCH_MINUTE_DURATIONS = [3, 10, 20, 45]            # trimmed from 9 candidates to 4
+NOTOUCH_BARRIER_SIGMAS   = [0.5, 1.0, 1.5, 2.0, 3.0]   # trimmed from 7 to 5
 NOTOUCH_MAX_SAFE_PROB    = 0.90   # reject barriers so wide the payout is near-stake
-MC_NOTOUCH_SIMS          = 5000
+MC_NOTOUCH_SIMS          = 2000   # trimmed from 5000 — negligible accuracy cost, much faster
 
 
 def notouch_candidate_grid(symbol):
@@ -3202,10 +3202,22 @@ async def select_notouch_trade(client, symbol, prices, returns, direction_bias, 
                                 tick_dt=tick_dt, models=models)
     if not grid:
         return None
-    grid.sort(key=lambda g: g["p_no_touch"], reverse=True)
+
+    # IMPORTANT: do not just take the top-N by p_no_touch — that always
+    # picks the safest/widest barriers, which is exactly where Deriv's
+    # payout converges closest to fair odds and leaves the least room for
+    # edge. Instead sample a spread across the whole sigma range (tight/
+    # risky through wide/safe) so a genuine edge in the middle of the
+    # distribution actually gets a chance to be found and quoted.
+    grid.sort(key=lambda g: g["sigma"])
+    if len(grid) <= top_k:
+        sampled = grid
+    else:
+        step = len(grid) / top_k
+        sampled = [grid[int(i * step)] for i in range(top_k)]
 
     best = None
-    for cand in grid[:top_k]:
+    for cand in sampled:
         q = await quote_notouch(client, symbol, cand["barrier_price"],
                                  cand["duration"], cand["duration_unit"], stake)
         if q is None:
@@ -4513,8 +4525,12 @@ async def main():
                 # We just need the best available directional signal to close
                 # the open sequence — not the same high bar as a fresh entry.
                 n_layers     = feats.get('n_layers', 17)
-                n_agree_s    = feats.get('agree_up' if direction == 1 else 'agree_down', 0)
-                n_disagree_s = feats.get('agree_down' if direction == 1 else 'agree_up', 0)
+                if direction == 1:
+                    n_agree_s    = feats.get('agree_up', 0)
+                    n_disagree_s = feats.get('disagree_up', 0)
+                else:
+                    n_agree_s    = feats.get('disagree_up', 0)
+                    n_disagree_s = feats.get('agree_up', 0)
                 if n_agree_s < 8 or n_disagree_s > 5:
                     continue
                 nt = await select_notouch_trade(
